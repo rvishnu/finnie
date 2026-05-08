@@ -1,0 +1,22 @@
+# ── config.yaml ──────────────────────────────────────────────────────────────
+llm:
+  model: "gpt-4o-mini"
+  temperature: 0
+  max_tokens: 1000
+
+embeddings:
+  model: "text-embedding-3-small"
+
+rag:
+  chunk_size: 800
+  chunk_overlap: 200
+  top_k: 4
+  index_path: "data/faiss_index"
+  raw_cache: "data/raw/articles.json"
+
+market:
+  delay_seconds: 2
+
+app:
+  title: "Finnie - AI Finance Assistant"
+  port: 8501

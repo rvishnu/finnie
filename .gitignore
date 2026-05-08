@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment — never commit secrets
+.env
+.env.*
+
+# uv local lockfile artifacts
+.python-version
+
+# IDE
+.vscode/
+.idea/
+*.DS_Store
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Streamlit local cache
+.streamlit/secrets.toml
+
+# Data cache (raw articles; the FAISS index IS committed via LFS)
+data/raw/
