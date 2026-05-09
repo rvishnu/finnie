@@ -35,7 +35,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import ToolNode, tools_condition, InjectedState
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, trim_messages
 from langchain_core.tools import tool
 
 from src.workflow.router import extract_params
@@ -61,7 +61,7 @@ class FinnieState(TypedDict):
     risk_profile:       str
     goal_amount:        float | None
     time_horizon_years: float | None
-    current_savings:    float
+    current_savings:    float | None   # None = not yet provided by user
 
 
 # ── Lazy agent singletons ─────────────────────────────────────────────────────
@@ -171,12 +171,43 @@ def plan_financial_goal(
     Examples: "I want $2M in 20 years", "How much to save for a house in 5 years".
     """
     log.info("Tool | plan_financial_goal | %r", query[:60])
-    result = _load()["goal"].run(
+
+    goal_amount        = state.get("goal_amount")
+    time_horizon_years = state.get("time_horizon_years")
+    current_savings    = state.get("current_savings")   # None = not yet provided
+    risk_profile       = state.get("risk_profile", "moderate")
+
+    # Parse the current message to fill any gaps
+    agent = _load()["goal"]
+    if query:
+        parsed = agent._parse_goal_from_text(query)
+        goal_amount        = goal_amount        or parsed.get("goal_amount")
+        time_horizon_years = time_horizon_years or parsed.get("time_horizon_years")
+        if current_savings is None and parsed.get("current_savings") is not None:
+            current_savings = parsed["current_savings"]
+
+    # Ask for missing required details rather than assuming defaults
+    missing = []
+    if not goal_amount:
+        missing.append("your savings target (e.g. '$500,000' or '$1 million')")
+    if not time_horizon_years:
+        missing.append("your timeline (e.g. 'in 20 years' or 'by age 65')")
+    if missing:
+        return "To build your savings plan I need: " + " and ".join(missing) + ". Could you share those?"
+
+    if current_savings is None:
+        return (
+            f"Got it — aiming for ${goal_amount:,.0f} in {time_horizon_years:.0f} years. "
+            "How much have you already saved toward this goal? "
+            "(Just reply with the amount, or say '$0' if you're starting from scratch.)"
+        )
+
+    result = agent.run(
         query=query,
-        goal_amount=state.get("goal_amount"),
-        time_horizon_years=state.get("time_horizon_years"),
-        current_savings=state.get("current_savings", 0.0),
-        risk_profile=state.get("risk_profile", "moderate"),
+        goal_amount=goal_amount,
+        time_horizon_years=time_horizon_years,
+        current_savings=current_savings,
+        risk_profile=risk_profile,
     )
     metrics = result.get("metrics", {})
     answer  = result.get("answer", "")
@@ -275,7 +306,8 @@ def _system_prompt(state: FinnieState) -> str:
     """Build a dynamic system prompt that includes the user's current context."""
     goal    = f"${state.get('goal_amount', 0):,.0f}"          if state.get("goal_amount")        else "not set"
     horizon = f"{state.get('time_horizon_years', 0)} years"   if state.get("time_horizon_years") else "not set"
-    savings = f"${state.get('current_savings', 0.0):,.0f}"
+    savings_val = state.get("current_savings")
+    savings = f"${savings_val:,.0f}" if savings_val is not None else "not yet provided"
 
     return f"""You are Finnie, a friendly financial education assistant.
 
@@ -363,8 +395,19 @@ def agent_node(state: FinnieState) -> dict:
     """
     llm_with_tools = load_llm().bind_tools(TOOLS)
 
-    messages = [SystemMessage(content=_system_prompt(state))] + state["messages"]
-    log.debug("LLM | sending %d messages", len(messages))
+    # Keep only the last 20 messages to avoid unbounded context growth.
+    # The system prompt always carries the key user context (goal, savings, risk),
+    # so trimming old turns doesn't lose critical state.
+    recent = trim_messages(
+        state["messages"],
+        max_tokens=20,
+        token_counter=len,      # count by message count, not tokens
+        strategy="last",
+        start_on="human",       # never start mid-tool-call
+        include_system=False,
+    )
+    messages = [SystemMessage(content=_system_prompt(state))] + recent
+    log.debug("LLM | sending %d messages (trimmed from %d)", len(messages), len(state["messages"]) + 1)
     response = llm_with_tools.invoke(messages)
 
     if response.tool_calls:
@@ -444,7 +487,7 @@ def invoke(query: str, thread_id: str = "default") -> dict:
     if not _get_graph().checkpointer.get(config):
         initial.update({
             "risk_profile":       "moderate",
-            "current_savings":    0.0,
+            "current_savings":    None,
             "goal_amount":        None,
             "time_horizon_years": None,
         })

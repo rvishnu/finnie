@@ -82,42 +82,6 @@ def helpers():
             sys.modules[k] = v
 
 
-# ── _parse_holdings ───────────────────────────────────────────────────────────
-
-class TestParseHoldings:
-
-    def test_colon_format(self, helpers):
-        assert helpers._parse_holdings("AAPL: 10, MSFT: 5") == {"AAPL": 10, "MSFT": 5}
-
-    def test_colon_format_with_extra_spaces(self, helpers):
-        assert helpers._parse_holdings("AAPL : 10  MSFT : 5") == {"AAPL": 10, "MSFT": 5}
-
-    def test_shares_first_format(self, helpers):
-        assert helpers._parse_holdings("10 AAPL, 5 MSFT") == {"AAPL": 10, "MSFT": 5}
-
-    def test_space_separated_single(self, helpers):
-        # Multi-ticker "AAPL 10 MSFT 5" is ambiguous — shares-first regex wins.
-        # Space-pairs branch handles single-ticker unambiguous input correctly.
-        assert helpers._parse_holdings("AAPL 10") == {"AAPL": 10}
-
-    def test_single_ticker(self, helpers):
-        assert helpers._parse_holdings("AAPL: 20") == {"AAPL": 20}
-
-    def test_many_tickers(self, helpers):
-        result = helpers._parse_holdings("AAPL: 10, MSFT: 5, BND: 20, QQQ: 8, NVDA: 3")
-        assert len(result) == 5
-        assert result["BND"] == 20
-
-    def test_float_shares_truncated_to_int(self, helpers):
-        assert helpers._parse_holdings("AAPL: 10.7")["AAPL"] == 10
-
-    def test_empty_string_returns_empty_dict(self, helpers):
-        assert helpers._parse_holdings("") == {}
-
-    def test_no_valid_holdings_returns_empty_dict(self, helpers):
-        assert helpers._parse_holdings("just some random words") == {}
-
-
 # ── _fmt_large ────────────────────────────────────────────────────────────────
 
 class TestFmtLarge:
@@ -244,7 +208,6 @@ def _run_app() -> AppTest:
         patch("src.web_app.app._portfolio_agent") as mock_pa,
         patch("src.web_app.app._market_agent")    as mock_ma,
         patch("src.web_app.app._fetch_stock_info", return_value=None),
-        patch("src.web_app.app._resolve_tickers", side_effect=lambda h: h),
     ):
         mock_pa.return_value.run.return_value = _PORTFOLIO_RESULT
         mock_ma.return_value.run.return_value = _MARKET_RESULT
@@ -318,10 +281,11 @@ class TestAppIntegration:
         at = AppTest.from_file(APP_PATH, default_timeout=30)
         with (
             patch("src.web_app.app.chat_invoke",  return_value=_CHAT_RESULT),
-            patch("src.web_app.app._portfolio_agent"),
+            patch("src.web_app.app._portfolio_agent") as mock_pa,
             patch("src.web_app.app._market_agent"),
             patch("src.web_app.app._fetch_stock_info", return_value=None),
         ):
+            mock_pa.return_value.run.return_value = {"answer": "No holdings found.", "metrics": {}, "failed": []}
             at.run()
             at.text_area[0].input("!!! not valid holdings !!!")
             analyze_btn = next(b for b in at.button if "Analyze" in b.label)
@@ -335,7 +299,6 @@ class TestAppIntegration:
             patch("src.web_app.app._portfolio_agent") as mock_pa,
             patch("src.web_app.app._market_agent"),
             patch("src.web_app.app._fetch_stock_info", return_value=None),
-            patch("src.web_app.app._resolve_tickers", side_effect=lambda h: h),
         ):
             mock_pa.return_value.run.return_value = _PORTFOLIO_RESULT
             at.run()
@@ -344,7 +307,7 @@ class TestAppIntegration:
             analyze_btn.click().run()
         assert at.session_state["portfolio_result"] is not None
 
-    def test_portfolio_agent_called_with_correct_holdings(self):
+    def test_portfolio_agent_called_with_query(self):
         import streamlit as st
         st.cache_resource.clear()   # evict any real agent cached by a prior test
         at = AppTest.from_file(APP_PATH, default_timeout=30)
@@ -353,7 +316,6 @@ class TestAppIntegration:
             patch("src.agents.portfolio_agent.PortfolioAnalysisAgent") as mock_cls,
             patch("src.web_app.app._market_agent"),
             patch("src.web_app.app._fetch_stock_info", return_value=None),
-            patch("src.web_app.app._resolve_tickers", side_effect=lambda h: h),
         ):
             mock_cls.return_value.run.return_value = _PORTFOLIO_RESULT
             at.run()
@@ -361,7 +323,7 @@ class TestAppIntegration:
             analyze_btn = next(b for b in at.button if "Analyze" in b.label)
             analyze_btn.click().run()
             call_kwargs = mock_cls.return_value.run.call_args[1]
-        assert call_kwargs["portfolio"] == {"AAPL": 10, "MSFT": 5}
+        assert call_kwargs["query"] == "AAPL: 10, MSFT: 5"
 
     # ── Chat tab ──────────────────────────────────────────────────────────────
 

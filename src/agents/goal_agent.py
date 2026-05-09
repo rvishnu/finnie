@@ -36,9 +36,9 @@ with open("config.yaml") as f:
     cfg = yaml.safe_load(f)
 
 class _GoalParams(BaseModel):
-    goal_amount:        float | None = Field(None, description="Target savings amount in dollars (e.g. 50000 for $50k)")
-    time_horizon_years: float | None = Field(None, description="Years until the goal (e.g. 5.0)")
-    current_savings:    float        = Field(0.0,  description="Amount already saved in dollars (0 if not mentioned)")
+    goal_amount:        float | None = Field(None, description="Target savings amount in dollars. Return null if not explicitly stated.")
+    time_horizon_years: float | None = Field(None, description="Number of years to reach the goal. Return null if the user does NOT explicitly state a number of years or months — do NOT guess or infer a default.")
+    current_savings:    float | None = Field(None, description="Amount already saved in dollars. Return null if not mentioned — do NOT assume zero.")
 
 
 # Annual return assumptions by risk profile
@@ -91,7 +91,7 @@ class GoalPlanningAgent:
         return {
             "goal_amount":        parsed.goal_amount,
             "time_horizon_years": parsed.time_horizon_years,
-            "current_savings":    parsed.current_savings or 0.0,
+            "current_savings":    parsed.current_savings,   # None = not mentioned
         }
 
     def _calculate_metrics(
@@ -165,7 +165,7 @@ class GoalPlanningAgent:
         query: str = "",
         goal_amount: float | None = None,
         time_horizon_years: float | None = None,
-        current_savings: float = 0.0,
+        current_savings: float | None = None,
         risk_profile: str = "moderate",
     ) -> dict:
         """
@@ -191,7 +191,7 @@ class GoalPlanningAgent:
                  risk_profile)
         annual_return = RETURN_RATES.get(risk_profile, RETURN_RATES["moderate"])
 
-        if goal_amount is None or time_horizon_years is None:
+        if goal_amount is None or time_horizon_years is None or current_savings is None:
             if not query:
                 return {
                     "answer":  "Please describe your financial goal so I can help you plan for it.",
@@ -201,7 +201,8 @@ class GoalPlanningAgent:
             parsed = self._parse_goal_from_text(query)
             goal_amount        = goal_amount        or parsed["goal_amount"]
             time_horizon_years = time_horizon_years or parsed["time_horizon_years"]
-            current_savings    = current_savings    or parsed["current_savings"]
+            if current_savings is None:
+                current_savings = parsed["current_savings"]  # still None if not mentioned
 
         if not goal_amount or not time_horizon_years:
             return {

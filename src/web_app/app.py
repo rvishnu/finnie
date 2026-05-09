@@ -11,7 +11,7 @@ Run:
     uv run streamlit run src/web_app/app.py
 """
 
-import re
+
 import sys
 import uuid
 from pathlib import Path
@@ -92,39 +92,6 @@ def _market_agent() -> MarketAnalysisAgent:
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _parse_holdings(text: str) -> dict[str, int]:
-    """
-    Parse user-entered holdings into {name_or_ticker: shares}.
-    Accepts tickers (AAPL) and company names (Apple, Microsoft).
-    Call _resolve_tickers() afterwards to normalise names to symbols.
-    """
-    holdings: dict[str, int] = {}
-
-    # Colon format: AAPL: 10  or  Apple: 10  or  Microsoft: 5
-    for m in re.finditer(r'\b([A-Za-z][A-Za-z0-9]{0,19})\s*:\s*(\d+(?:\.\d+)?)\b', text):
-        holdings[m.group(1)] = int(float(m.group(2)))  # keep original case for LLM resolution
-    if holdings:
-        return holdings
-
-    # Shares-first: 10 AAPL, 5 Microsoft
-    for m in re.finditer(r'\b(\d+(?:\.\d+)?)\s+([A-Za-z][A-Za-z0-9]{0,19})\b', text):
-        holdings[m.group(2)] = int(float(m.group(1)))  # keep original case for LLM resolution
-    if holdings:
-        return holdings
-
-    # Space-separated pairs: AAPL 10 MSFT 5
-    parts = text.split()
-    i = 0
-    while i < len(parts) - 1:
-        if re.fullmatch(r'[A-Za-z]{1,5}', parts[i]) and re.fullmatch(r'\d+', parts[i + 1]):
-            holdings[parts[i]] = int(parts[i + 1])
-            i += 2
-        else:
-            i += 1
-
-    return holdings
-
-
 @st.cache_data(ttl=3600)
 def _resolve_ticker(name: str) -> str:
     """Resolve a ticker, company name, or misspelling to a canonical ticker.
@@ -135,9 +102,6 @@ def _resolve_ticker(name: str) -> str:
     return extract_ticker(name, load_llm()) or name
 
 
-def _resolve_tickers(holdings: dict[str, int]) -> dict[str, int]:
-    """Resolve any company-name keys to ticker symbols."""
-    return {_resolve_ticker(k): v for k, v in holdings.items()}
 
 
 def _fmt_large(n) -> str:
@@ -192,7 +156,7 @@ with st.sidebar:
 
     st.divider()
 
-    if st.button("🔄 New Conversation", use_container_width=True):
+    if st.button("🔄 New Conversation", width="stretch"):
         log.info("New conversation started — thread_id=%s", st.session_state.thread_id[:8])
         st.session_state.thread_id   = str(uuid.uuid4())
         st.session_state.chat_history = []
@@ -273,9 +237,9 @@ with portfolio_tab:
     with col_input:
         holdings_text = st.text_area(
             "Your Holdings",
-            placeholder="AAPL: 10, MSFT: 5, BND: 20, QQQ: 8, NVDA: 3",
+            placeholder="e.g. RKLB - 200, Google - 60, 10 Apple shares, MSFT: 5",
             height=80,
-            help="Format: TICKER: shares, e.g. AAPL: 10, MSFT: 5",
+            help="Any format works — tickers, company names, or plain English. e.g. 'Google - 60, 10 Apple shares, MSFT: 5'",
         )
 
     with col_risk:
@@ -285,31 +249,27 @@ with portfolio_tab:
             index=1,
         )
 
-    analyze_btn = st.button("🔍 Analyze Portfolio", type="primary", use_container_width=False)
+    analyze_btn = st.button("🔍 Analyze Portfolio", type="primary", width="content")
 
     if analyze_btn:
         if not holdings_text.strip():
-            st.warning("Please enter at least one holding (e.g. AAPL: 10).")
+            st.warning("Please enter your holdings — tickers, company names, or plain English.")
         else:
-            holdings = _parse_holdings(holdings_text)
-            if not holdings:
-                st.error("Could not parse holdings. Try: AAPL: 10, MSFT: 5")
-                log.warning("Portfolio | could not parse input: %r", holdings_text[:80])
+            log.info("Portfolio | input=%r | risk=%s", holdings_text[:80], risk_profile)
+            with st.spinner("Analysing your portfolio…"):
+                result = _portfolio_agent().run(
+                    query=holdings_text,
+                    risk_profile=risk_profile,
+                )
+            failed = result.get("failed", [])
+            if failed:
+                log.warning("Portfolio | failed tickers=%s", failed)
+            if not result.get("metrics"):
+                st.error("Could not identify any holdings. Try describing them like: '10 Apple shares, 5 Microsoft, 20 BND'.")
             else:
-                with st.spinner("Resolving tickers…"):
-                    holdings = _resolve_tickers(holdings)
-                log.info("Portfolio | tickers=%s | risk=%s", list(holdings.keys()), risk_profile)
-                with st.spinner(f"Fetching live data for {', '.join(holdings.keys())}…"):
-                    result = _portfolio_agent().run(
-                        portfolio=holdings,
-                        risk_profile=risk_profile,
-                    )
-                failed = result.get("failed", [])
-                if failed:
-                    log.warning("Portfolio | failed tickers=%s", failed)
                 log.info("Portfolio | done | value=$%.2f | score=%s",
-                         result.get("metrics", {}).get("total_value", 0),
-                         result.get("metrics", {}).get("diversification_score", "n/a"))
+                         result["metrics"].get("total_value", 0),
+                         result["metrics"].get("diversification_score", "n/a"))
                 st.session_state.portfolio_result = result
 
     # ── Display results ───────────────────────────────────────────────────────
@@ -349,7 +309,7 @@ with portfolio_tab:
                     )
                     fig.update_traces(textposition="inside", textinfo="percent+label")
                     fig.update_layout(margin=dict(t=40, b=0, l=0, r=0), showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
             with chart_mid:
                 asset_pct = metrics.get("asset_pct", {})
@@ -363,7 +323,7 @@ with portfolio_tab:
                     )
                     fig.update_traces(textposition="inside", textinfo="percent+label")
                     fig.update_layout(margin=dict(t=40, b=0, l=0, r=0), showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
             with chart_right:
                 holdings_list = metrics.get("holdings", [])
@@ -386,7 +346,7 @@ with portfolio_tab:
                         coloraxis_showscale=False,
                         yaxis=dict(tickfont=dict(size=12)),
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
             # ── Holdings table ────────────────────────────────────────────────
             st.subheader("Holdings Detail")
@@ -398,7 +358,7 @@ with portfolio_tab:
                 df_table["Price ($)"]      = df_table["Price ($)"].apply(lambda x: f"${x:,.2f}")
                 df_table["Value ($)"]      = df_table["Value ($)"].apply(lambda x: f"${x:,.2f}")
                 df_table["Allocation (%)"] = df_table["Allocation (%)"].apply(lambda x: f"{x:.1f}%")
-                st.dataframe(df_table, use_container_width=True, hide_index=True)
+                st.dataframe(df_table, width="stretch", hide_index=True)
 
             # ── AI analysis ───────────────────────────────────────────────────
             with st.expander("📝 Finnie's Analysis", expanded=True):
@@ -411,13 +371,13 @@ with portfolio_tab:
 
 with market_tab:
     st.header("Market Overview")
-    st.caption("Real-time stock data, 52-week range, and 30-day price history for any ticker.")
+    st.caption("Real-time stock data, 52-week range, and 30-day price history — one stock at a time. For multiple stocks use the Portfolio tab.")
 
     col_search, col_period = st.columns([3, 1])
     with col_search:
         ticker_input = st.text_input(
             "Ticker Symbol",
-            placeholder="AAPL, Tesla, Nvidia, Microsoft, SPY …",
+            placeholder="One ticker or company name — e.g. Tesla, AAPL, SPY",
             label_visibility="collapsed",
         ).strip()  # keep original case so extract_ticker's LLM path handles company names
     with col_period:
@@ -426,6 +386,15 @@ with market_tab:
     lookup_btn = st.button("🔍 Look Up", type="primary")
 
     if lookup_btn and ticker_input:
+        # Detect multi-stock input: any comma, " and ", or " & " between names
+        t_lower = ticker_input.lower()
+        if "," in ticker_input or " and " in t_lower or " & " in t_lower:
+            st.warning(
+                "This tab looks up one stock at a time. "
+                "For multiple stocks, use the **Portfolio** tab."
+            )
+            st.stop()
+
         log.info("Market | input=%r", ticker_input)
         with st.spinner(f"Resolving {ticker_input}…"):
             resolved = _resolve_ticker(ticker_input)
@@ -492,7 +461,7 @@ with market_tab:
                     title={"text": "52-Week Range"},
                 ))
                 fig_gauge.update_layout(height=200, margin=dict(t=30, b=0, l=20, r=20))
-                st.plotly_chart(fig_gauge, use_container_width=True)
+                st.plotly_chart(fig_gauge, width="stretch")
 
         st.divider()
 
@@ -544,7 +513,7 @@ with market_tab:
             fig_hist.update_xaxes(
                 rangebreaks=[dict(bounds=["sat", "mon"])]  # hide weekends
             )
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, width="stretch")
 
             # Volume bar chart below
             fig_vol = px.bar(
@@ -560,7 +529,7 @@ with market_tab:
                 showlegend=False,
                 yaxis_title="Volume",
             )
-            st.plotly_chart(fig_vol, use_container_width=True)
+            st.plotly_chart(fig_vol, width="stretch")
 
         # ── Company description ───────────────────────────────────────────────
         if data.get("description"):
@@ -587,7 +556,7 @@ with market_tab:
         quick_tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "QQQ"]
         for i, qt in enumerate(quick_tickers):
             with quick_cols[i]:
-                if st.button(qt, use_container_width=True):
+                if st.button(qt, width="stretch"):
                     with st.spinner(f"Fetching {qt}…"):
                         d = _fetch_stock_info(qt)
                         h = yf.Ticker(qt).history(period="1mo") if d else None
