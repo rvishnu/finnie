@@ -17,6 +17,9 @@ import re
 from functools import wraps
 from langchain_core.tools import tool
 from dotenv import load_dotenv
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
 
 load_dotenv()
 
@@ -35,7 +38,9 @@ def _with_cache(fn):
         if key in _CACHE:
             value, ts = _CACHE[key]
             if time.time() - ts < _CACHE_TTL:
+                log.debug("Cache HIT  | %s", key)
                 return value
+        log.debug("Cache MISS | %s", key)
         result = fn(ticker)
         if result is not None:
             _CACHE[key] = (result, time.time())
@@ -61,7 +66,7 @@ def _fetch_alpha_vantage(ticker: str) -> dict | None:
         data = resp.json()
 
         if "Note" in data:
-            print("Alpha Vantage rate limit hit, falling back to yfinance")
+            log.warning("Alpha Vantage rate limit hit — falling back to yfinance")
             return None
 
         quote = data.get("Global Quote", {})

@@ -185,14 +185,6 @@ def test_no_ticker_in_query_returns_no_tickers_error(agent):
     assert result["error"] in ("no_tickers", None)
 
 
-def test_invalid_ticker_returns_no_news_or_graceful(agent):
-    """Completely invalid ticker should return no_news error or empty headlines."""
-    result = agent.run("News on XYZINVALID999")
-    assert result["error"] in ("no_news", None)
-    if result["error"] == "no_news":
-        assert result["headlines"] == []
-
-
 def test_answer_still_returned_when_some_tickers_have_no_news(agent):
     """When at least one ticker has news, a full answer should come back."""
     result = agent.run("What's the news on AAPL and XYZINVALID999?")

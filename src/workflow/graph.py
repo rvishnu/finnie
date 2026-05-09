@@ -40,6 +40,9 @@ from langchain_core.tools import tool
 
 from src.workflow.router import extract_params
 from src.core.llm import load_llm
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
 from src.agents.qa_agent        import FinanceQAAgent
 from src.agents.portfolio_agent import PortfolioAnalysisAgent
 from src.agents.market_agent    import MarketAnalysisAgent
@@ -96,6 +99,7 @@ def answer_finance_question(
     Use for: what is X, how does Y work, difference between A and B,
     compound interest, index funds, diversification, ETFs, bonds, etc.
     """
+    log.info("Tool | answer_finance_question | %r", query[:60])
     result = _load()["qa"].run(query)
     answer = result.get("answer", "")
     citations = result.get("citations", [])
@@ -119,6 +123,7 @@ def analyze_portfolio(
     diversification score, sector breakdown, or portfolio health.
     Examples: "I have 10 AAPL and 5 MSFT", "analyze my portfolio".
     """
+    log.info("Tool | analyze_portfolio | %r", query[:60])
     result = _load()["portfolio"].run(
         query=query,
         risk_profile=state.get("risk_profile", "moderate"),
@@ -148,6 +153,7 @@ def get_market_data(
     P/E ratio, market cap, or wants company analysis.
     Examples: "How is AAPL doing?", "Tell me about Tesla stock".
     """
+    log.info("Tool | get_market_data | %r", query[:60])
     result = _load()["market"].run(query)
     return result.get("answer", "")
 
@@ -164,6 +170,7 @@ def plan_financial_goal(
     or any financial target with an amount and timeline.
     Examples: "I want $2M in 20 years", "How much to save for a house in 5 years".
     """
+    log.info("Tool | plan_financial_goal | %r", query[:60])
     result = _load()["goal"].run(
         query=query,
         goal_amount=state.get("goal_amount"),
@@ -198,6 +205,7 @@ def get_financial_news(
     with a specific company or set of companies.
     Examples: "What's the news on NVDA?", "Latest on AAPL and MSFT".
     """
+    log.info("Tool | get_financial_news | %r", query[:60])
     result = _load()["news"].run(query)
     headlines = result.get("headlines", [])
     answer    = result.get("answer", "")
@@ -224,6 +232,7 @@ def get_tax_education(
               "How much can I put in my Roth IRA?",
               "What is tax-loss harvesting?".
     """
+    log.info("Tool | get_tax_education | %r", query[:60])
     result = _load()["tax"].run(query)
     metrics = result.get("metrics", {})
     answer  = result.get("answer", "")
@@ -355,7 +364,13 @@ def agent_node(state: FinnieState) -> dict:
     llm_with_tools = load_llm().bind_tools(TOOLS)
 
     messages = [SystemMessage(content=_system_prompt(state))] + state["messages"]
+    log.debug("LLM | sending %d messages", len(messages))
     response = llm_with_tools.invoke(messages)
+
+    if response.tool_calls:
+        log.info("LLM | → tool_calls: %s", [tc["name"] for tc in response.tool_calls])
+    else:
+        log.info("LLM | → final answer (%d chars)", len(str(response.content)))
 
     return {"messages": [response]}
 
@@ -420,20 +435,27 @@ def invoke(query: str, thread_id: str = "default") -> dict:
         }
     """
     config = {"configurable": {"thread_id": thread_id}}
+    log.info("Invoke | thread=%s | query=%r", thread_id[:8], query[:80])
 
-    result = _get_graph().invoke(
-        {
-            "messages":          [HumanMessage(content=query)],
-            "risk_profile":      "moderate",
-            "current_savings":   0.0,
-            "goal_amount":       None,
+    # Only pass defaults on the first turn — subsequent invokes must NOT pass
+    # these fields or LangGraph's LastValue channel will overwrite the
+    # persisted checkpoint values (e.g. resetting "aggressive" → "moderate").
+    initial: dict = {"messages": [HumanMessage(content=query)]}
+    if not _get_graph().checkpointer.get(config):
+        initial.update({
+            "risk_profile":       "moderate",
+            "current_savings":    0.0,
+            "goal_amount":        None,
             "time_horizon_years": None,
-        },
-        config=config,
-    )
+        })
+
+    result = _get_graph().invoke(initial, config=config)
 
     # Last message is always the LLM's final answer
     last = result["messages"][-1]
+    n_messages = len(result["messages"])
+    log.info("Invoke | thread=%s | messages=%d | answer_len=%d",
+             thread_id[:8], n_messages, len(str(last.content)))
     return {
         "answer":   str(last.content),
         "messages": result["messages"],

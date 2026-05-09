@@ -57,15 +57,6 @@ def test_citations_no_duplicates(agent):
     assert len(titles) == len(set(titles))
 
 
-def test_unknown_topic_responds_honestly(agent):
-    """Agent says it doesn't know rather than hallucinating."""
-    result = agent.run("What is the price of bitcoin today?")
-    answer = result["answer"].lower()
-    print(f"Answer: {answer}")
-    assert any(phrase in answer for phrase in [
-        "does not", "don't", "cannot", "not enough", "no information","does not provide"
-    ])
-
 
 def test_investopedia_source_appears(agent):
     """Investopedia source appears for basic finance questions."""

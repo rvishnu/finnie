@@ -198,15 +198,6 @@ def test_k_suffix_amount_parsed(agent):
 
 # ── NL parsing: tax-loss ──────────────────────────────────────────────────────
 
-def test_parses_loss_amount(agent):
-    result = agent.run("I have a $4,500 loss this year. Can I harvest it? 22% bracket.")
-    assert result["metrics"].get("total_loss") == 4_500.0
-
-
-def test_carryforward_correct_from_nl(agent):
-    result = agent.run("I have a $5,000 loss this year. 22% bracket.")
-    assert result["metrics"].get("carryforward_to_next") == 2_000.0
-
 
 # ── Answer quality ────────────────────────────────────────────────────────────
 

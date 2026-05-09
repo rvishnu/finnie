@@ -20,6 +20,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from src.core.llm import load_llm
 from src.rag.retriever import get_retriever
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
 
 MAX_HEADLINES_PER_TICKER = 5
 MAX_TICKERS              = 5
@@ -207,6 +210,7 @@ class NewsSynthesizerAgent:
                 "error":     "no_input",
             }
 
+        log.info("NewsSynthesizerAgent | query=%r", query[:60])
         tickers = self._extract_tickers(query)
 
         if not tickers:
@@ -244,6 +248,7 @@ class NewsSynthesizerAgent:
             "query":     query,
         })
 
+        log.info("NewsSynthesizerAgent | done | tickers=%s | headlines=%d", tickers, len(headlines))
         return {
             "answer":    answer,
             "headlines": headlines,

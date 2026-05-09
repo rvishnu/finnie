@@ -17,16 +17,23 @@ Usage:
     print(result["metrics"])
 """
 
-import re
-import yaml
 import yfinance as yf
+from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from src.core.llm import load_llm
 from src.rag.retriever import get_retriever
+from src.utils.logger import get_logger
 
-with open("config.yaml") as f:
-    cfg = yaml.safe_load(f)
+log = get_logger(__name__)
+
+class _Holding(BaseModel):
+    ticker: str   = Field(description="Stock ticker symbol, e.g. AAPL. Convert company names to tickers.")
+    shares: float = Field(description="Number of shares held")
+
+class _PortfolioParams(BaseModel):
+    holdings: list[_Holding] = Field(description="All holdings extracted from the text")
+
 
 PROMPT = ChatPromptTemplate.from_template("""
 You are Finnie, a friendly financial education assistant.
@@ -56,47 +63,17 @@ Analysis:
 class PortfolioAnalysisAgent:
 
     def __init__(self):
-        self.retriever = get_retriever()
-        self.llm       = load_llm()
+        self.retriever        = get_retriever()
+        self.llm              = load_llm()
+        self.chain            = PROMPT | self.llm | StrOutputParser()
+        self.portfolio_parser = self.llm.with_structured_output(_PortfolioParams)
 
     def _parse_portfolio_from_text(self, text: str) -> dict[str, float]:
-        """
-        Parse portfolio from natural language.
-        Handles formats like:
-          - "AAPL: 10, MSFT: 5"
-          - "10 shares of Apple, 5 Microsoft"
-        Falls back to LLM for complex phrasing.
-        """
-        portfolio = {}
-
-        # Pattern: TICKER: N  or  TICKER N shares
-        pattern = r'\b([A-Z]{1,5})\b[\s:]+(\d+(?:\.\d+)?)\s*(?:shares?)?'
-        matches = re.findall(pattern, text)
-        if matches:
-            for ticker, shares in matches:
-                portfolio[ticker.upper()] = float(shares)
-            if portfolio:
-                return portfolio
-
-        # Fallback: LLM extracts ticker/share pairs as CSV
-        response = self.llm.invoke(
-            "Extract all stock tickers and share counts from this text. "
-            "Return ONLY lines in the format: TICKER,SHARES (one per line). "
-            "Convert company names to tickers (Apple→AAPL, Microsoft→MSFT, etc.). "
-            "Example output:\nAAPL,10\nMSFT,5\n\nText: " + text
-        ).content.strip()
-
-        for line in response.splitlines():
-            parts = line.strip().split(",")
-            if len(parts) == 2:
-                ticker = parts[0].strip().upper()
-                try:
-                    shares = float(parts[1].strip())
-                    portfolio[ticker] = shares
-                except ValueError:
-                    continue
-
-        return portfolio
+        """Extract holdings from natural language using structured output."""
+        parsed = self.portfolio_parser.invoke(
+            f"Extract all stock holdings from this text:\n\n{text}"
+        )
+        return {h.ticker.upper(): h.shares for h in parsed.holdings}
 
     def _fetch_holding(self, ticker: str, shares: float) -> dict | None:
         """Fetch live price and metadata for a single holding."""
@@ -220,6 +197,7 @@ class PortfolioAnalysisAgent:
                 "failed":  [tickers that couldn't be fetched]
             }
         """
+        log.info("PortfolioAnalysisAgent | positions=%d | risk=%s", len(portfolio or {}), risk_profile)
         if portfolio is None:
             if not query:
                 return {"answer": "Please provide a portfolio to analyze.", "metrics": {}, "failed": []}
@@ -257,13 +235,16 @@ class PortfolioAnalysisAgent:
         rag_query   = query or "portfolio diversification asset allocation risk"
         context     = self._get_rag_context(rag_query)
 
-        chain  = PROMPT | self.llm | StrOutputParser()
-        answer = chain.invoke({
+        answer = self.chain.invoke({
             "metrics":      metrics_str,
             "context":      context,
             "risk_profile": risk_profile,
         })
 
+        log.info("PortfolioAnalysisAgent | done | value=$%.0f | score=%s | failed=%s",
+                 metrics.get("total_value", 0),
+                 metrics.get("diversification_score", "n/a"),
+                 failed or "none")
         return {
             "answer":  answer,
             "metrics": metrics,

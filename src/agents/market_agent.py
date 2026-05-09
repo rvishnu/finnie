@@ -16,6 +16,9 @@ from langchain_core.output_parsers import StrOutputParser
 from src.core.llm import load_llm
 from src.rag.retriever import get_retriever
 from src.utils.market_tools import get_stock_data, get_stock_news, extract_ticker
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
 
 PROMPT = ChatPromptTemplate.from_template("""
 You are Finnie, a financial analysis assistant.
@@ -80,6 +83,7 @@ class MarketAnalysisAgent:
                 "source": str   (Alpha Vantage or Yahoo Finance)
             }
         """
+        log.info("MarketAnalysisAgent | query=%r", query[:60])
         ticker = extract_ticker(query, self.llm)
 
         if not ticker:
@@ -109,6 +113,7 @@ class MarketAnalysisAgent:
         if "Alpha Vantage" in stock_data:
             source = "Alpha Vantage"
 
+        log.info("MarketAnalysisAgent | done | ticker=%s | source=%s", ticker, source)
         return {
             "answer": answer,
             "ticker": ticker,

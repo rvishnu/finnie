@@ -19,15 +19,15 @@ Usage:
     print(result["metrics"])
 """
 
-import re
-import yaml
+from typing import Literal
+from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from src.core.llm import load_llm
 from src.rag.retriever import get_retriever
+from src.utils.logger import get_logger
 
-with open("config.yaml") as f:
-    cfg = yaml.safe_load(f)
+log = get_logger(__name__)
 
 # ── Tax constants (2024 US, single filer) ─────────────────────────────────────
 
@@ -78,6 +78,17 @@ ACCOUNT_LIMITS: dict[str, dict] = {
     },
 }
 
+class _TaxQuery(BaseModel):
+    scenario:       Literal["capital_gains", "account_limits", "tax_loss", "general"] = Field(
+                        description="Tax scenario: capital_gains for sale/gain/profit, "
+                                    "account_limits for IRA/401k/HSA contributions, "
+                                    "tax_loss for harvesting losses, general otherwise")
+    gain_or_loss:   float | None = Field(None, description="Dollar amount of gain or loss")
+    holding_months: int   | None = Field(None, description="Holding period in months (12 months = 1 year)")
+    bracket:        str          = Field("22%", description="Income tax bracket e.g. '22%'. Default 22% if not mentioned")
+    account_type:   str   | None = Field(None, description="Account type: 401k, roth_ira, ira, or hsa")
+
+
 PROMPT = ChatPromptTemplate.from_template("""
 You are Finnie, a friendly financial education assistant specialising in US taxes.
 Explain the tax situation below in plain English. Be accurate, beginner-friendly,
@@ -105,115 +116,51 @@ Explanation:
 class TaxEducationAgent:
 
     def __init__(self):
-        self.retriever = get_retriever()
-        self.llm       = load_llm()
-
-    # ── Query classification ───────────────────────────────────────────────────
-
-    def _classify(self, query: str) -> str:
-        """Return one of: capital_gains | account_limits | tax_loss | general."""
-        q = query.lower()
-        if any(w in q for w in ("sold", "sell", "gain", "profit", "capital gain")):
-            return "capital_gains"
-        if any(w in q for w in ("roth", "ira", "401k", "hsa", "contribute", "contribution", "limit")):
-            return "account_limits"
-        if any(w in q for w in ("loss", "harvest", "tax-loss", "write off", "write-off")):
-            return "tax_loss"
-        return "general"
-
-    # ── Parsers ───────────────────────────────────────────────────────────────
-
-    def _parse_dollar(self, text: str) -> float | None:
-        """Extract the first dollar amount from text (supports $5k, $5,000)."""
-        m = re.search(
-            r'\$\s*([\d,]+(?:\.\d+)?)\s*([kKmM]?)',
-            text,
-        )
-        if not m:
-            return None
-        val = float(m.group(1).replace(",", ""))
-        suf = m.group(2).lower()
-        if suf == "k":
-            val *= 1_000
-        elif suf == "m":
-            val *= 1_000_000
-        return val
-
-    def _parse_holding_months(self, text: str) -> int | None:
-        """Extract holding period in months from text."""
-        year_m  = re.search(r'\b(\d+(?:\.\d+)?)\s*years?\b',  text, re.IGNORECASE)
-        month_m = re.search(r'\b(\d+(?:\.\d+)?)\s*months?\b', text, re.IGNORECASE)
-        if year_m:
-            return int(float(year_m.group(1)) * 12)
-        if month_m:
-            return int(float(month_m.group(1)))
-        return None
-
-    def _parse_bracket(self, text: str) -> str:
-        """Extract income tax bracket string like '22%' from text."""
-        m = re.search(r'\b(10|12|22|24|32|35|37)\s*%', text)
-        return f"{m.group(1)}%" if m else "22%"  # default to 22% if not mentioned
-
-    def _parse_account_type(self, text: str) -> str:
-        """Detect which account type is being asked about."""
-        q = text.lower()
-        if "roth ira" in q or "roth" in q:
-            return "roth_ira"
-        if "hsa" in q:
-            return "hsa"
-        if "401k" in q or "401(k)" in q:
-            return "401k"
-        if "ira" in q:
-            return "ira"
-        return "ira"
+        self.retriever    = get_retriever()
+        self.llm          = load_llm()
+        self.chain        = PROMPT | self.llm | StrOutputParser()
+        self.query_parser = self.llm.with_structured_output(_TaxQuery)
 
     # ── Calculators ───────────────────────────────────────────────────────────
 
-    def _calc_capital_gains(self, query: str) -> dict:
-        gain             = self._parse_dollar(query) or 0.0
-        holding_months   = self._parse_holding_months(query)
-        bracket          = self._parse_bracket(query)
-        is_long_term     = holding_months is not None and holding_months >= 12
-        holding_type     = "long_term" if is_long_term else "short_term"
-        tax_rate         = (LONG_TERM_RATE if is_long_term else SHORT_TERM_RATE).get(bracket, 0.15)
-        estimated_tax    = round(gain * tax_rate, 2)
-
+    def _calc_capital_gains(self, q: _TaxQuery) -> dict:
+        gain         = q.gain_or_loss or 0.0
+        is_long_term = q.holding_months is not None and q.holding_months >= 12
+        holding_type = "long_term" if is_long_term else "short_term"
+        tax_rate     = (LONG_TERM_RATE if is_long_term else SHORT_TERM_RATE).get(q.bracket, 0.15)
+        estimated_tax = round(gain * tax_rate, 2)
         return {
             "scenario":              "capital_gains",
             "gain":                  round(gain, 2),
-            "holding_period_months": holding_months,
+            "holding_period_months": q.holding_months,
             "holding_type":          holding_type,
-            "income_bracket":        bracket,
+            "income_bracket":        q.bracket,
             "tax_rate_pct":          round(tax_rate * 100, 1),
             "estimated_tax":         estimated_tax,
             "net_gain":              round(gain - estimated_tax, 2),
         }
 
-    def _calc_account_limits(self, query: str) -> dict:
-        account   = self._parse_account_type(query)
-        info      = ACCOUNT_LIMITS[account]
+    def _calc_account_limits(self, q: _TaxQuery) -> dict:
+        account = (q.account_type or "ira").lower().replace(" ", "_")
+        info    = ACCOUNT_LIMITS.get(account, ACCOUNT_LIMITS["ira"])
         return {
-            "scenario":      "account_limits",
-            "account_type":  account.upper().replace("_", " "),
+            "scenario":     "account_limits",
+            "account_type": account.upper().replace("_", " "),
             **info,
         }
 
-    def _calc_tax_loss(self, query: str) -> dict:
-        loss = self._parse_dollar(query) or 0.0
-        # US allows up to $3,000 of net losses to offset ordinary income per year
-        deductible_this_year   = min(loss, 3_000)
-        carryforward           = max(loss - 3_000, 0.0)
-        bracket                = self._parse_bracket(query)
-        rate                   = SHORT_TERM_RATE.get(bracket, 0.22)
-        tax_saving_this_year   = round(deductible_this_year * rate, 2)
-
+    def _calc_tax_loss(self, q: _TaxQuery) -> dict:
+        loss                 = q.gain_or_loss or 0.0
+        deductible_this_year = min(loss, 3_000)
+        carryforward         = max(loss - 3_000, 0.0)
+        rate                 = SHORT_TERM_RATE.get(q.bracket, 0.22)
         return {
-            "scenario":               "tax_loss_harvesting",
-            "total_loss":             round(loss, 2),
-            "deductible_this_year":   round(deductible_this_year, 2),
-            "carryforward_to_next":   round(carryforward, 2),
-            "income_bracket":         bracket,
-            "estimated_tax_saving":   tax_saving_this_year,
+            "scenario":             "tax_loss_harvesting",
+            "total_loss":           round(loss, 2),
+            "deductible_this_year": round(deductible_this_year, 2),
+            "carryforward_to_next": round(carryforward, 2),
+            "income_bracket":       q.bracket,
+            "estimated_tax_saving": round(deductible_this_year * rate, 2),
         }
 
     # ── Formatting ────────────────────────────────────────────────────────────
@@ -259,22 +206,23 @@ class TaxEducationAgent:
                 "error":    "no_input",
             }
 
-        scenario = self._classify(query)
+        parsed   = self.query_parser.invoke(query)
+        scenario = parsed.scenario
+        log.info("TaxEducationAgent | scenario=%s | query=%r", scenario, query[:60])
 
         if scenario == "capital_gains":
-            metrics = self._calc_capital_gains(query)
+            metrics = self._calc_capital_gains(parsed)
         elif scenario == "account_limits":
-            metrics = self._calc_account_limits(query)
+            metrics = self._calc_account_limits(parsed)
         elif scenario == "tax_loss":
-            metrics = self._calc_tax_loss(query)
+            metrics = self._calc_tax_loss(parsed)
         else:
             metrics = {}
 
         metrics_str = self._format_metrics(metrics) if metrics else "No specific metrics calculated — general question."
         context     = self._get_rag_context(query)
 
-        chain  = PROMPT | self.llm | StrOutputParser()
-        answer = chain.invoke({
+        answer = self.chain.invoke({
             "scenario": scenario.replace("_", " ").title(),
             "metrics":  metrics_str,
             "context":  context,

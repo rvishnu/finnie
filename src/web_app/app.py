@@ -31,6 +31,9 @@ from src.workflow.graph import invoke as chat_invoke
 from src.agents.portfolio_agent import PortfolioAnalysisAgent
 from src.agents.market_agent import MarketAnalysisAgent
 from src.utils.market_tools import _fetch_alpha_vantage, _fetch_yfinance
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
 
 
 def _fetch_stock_info(ticker: str) -> dict | None:
@@ -99,21 +102,21 @@ def _parse_holdings(text: str) -> dict[str, int]:
 
     # Colon format: AAPL: 10  or  Apple: 10  or  Microsoft: 5
     for m in re.finditer(r'\b([A-Za-z][A-Za-z0-9]{0,19})\s*:\s*(\d+(?:\.\d+)?)\b', text):
-        holdings[m.group(1).upper()] = int(float(m.group(2)))
+        holdings[m.group(1)] = int(float(m.group(2)))  # keep original case for LLM resolution
     if holdings:
         return holdings
 
     # Shares-first: 10 AAPL, 5 Microsoft
     for m in re.finditer(r'\b(\d+(?:\.\d+)?)\s+([A-Za-z][A-Za-z0-9]{0,19})\b', text):
-        holdings[m.group(2).upper()] = int(float(m.group(1)))
+        holdings[m.group(2)] = int(float(m.group(1)))  # keep original case for LLM resolution
     if holdings:
         return holdings
 
     # Space-separated pairs: AAPL 10 MSFT 5
-    parts = text.upper().split()
+    parts = text.split()
     i = 0
     while i < len(parts) - 1:
-        if re.fullmatch(r'[A-Z]{1,5}', parts[i]) and re.fullmatch(r'\d+', parts[i + 1]):
+        if re.fullmatch(r'[A-Za-z]{1,5}', parts[i]) and re.fullmatch(r'\d+', parts[i + 1]):
             holdings[parts[i]] = int(parts[i + 1])
             i += 2
         else:
@@ -190,6 +193,7 @@ with st.sidebar:
     st.divider()
 
     if st.button("🔄 New Conversation", use_container_width=True):
+        log.info("New conversation started — thread_id=%s", st.session_state.thread_id[:8])
         st.session_state.thread_id   = str(uuid.uuid4())
         st.session_state.chat_history = []
         st.rerun()
@@ -246,9 +250,11 @@ with chat_tab:
 
     # User input
     if prompt := st.chat_input("Ask Finnie anything about your finances…"):
+        log.info("Chat | thread=%s | query=%r", st.session_state.thread_id[:8], prompt[:80])
         with st.spinner("Finnie is thinking…"):
             result = chat_invoke(prompt, thread_id=st.session_state.thread_id)
             answer = result["answer"]
+        log.info("Chat | thread=%s | answer_len=%d", st.session_state.thread_id[:8], len(answer))
         st.session_state.chat_history.append({"role": "user",      "content": prompt})
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
         st.rerun()
@@ -288,14 +294,22 @@ with portfolio_tab:
             holdings = _parse_holdings(holdings_text)
             if not holdings:
                 st.error("Could not parse holdings. Try: AAPL: 10, MSFT: 5")
+                log.warning("Portfolio | could not parse input: %r", holdings_text[:80])
             else:
                 with st.spinner("Resolving tickers…"):
                     holdings = _resolve_tickers(holdings)
+                log.info("Portfolio | tickers=%s | risk=%s", list(holdings.keys()), risk_profile)
                 with st.spinner(f"Fetching live data for {', '.join(holdings.keys())}…"):
                     result = _portfolio_agent().run(
                         portfolio=holdings,
                         risk_profile=risk_profile,
                     )
+                failed = result.get("failed", [])
+                if failed:
+                    log.warning("Portfolio | failed tickers=%s", failed)
+                log.info("Portfolio | done | value=$%.2f | score=%s",
+                         result.get("metrics", {}).get("total_value", 0),
+                         result.get("metrics", {}).get("diversification_score", "n/a"))
                 st.session_state.portfolio_result = result
 
     # ── Display results ───────────────────────────────────────────────────────
@@ -405,24 +419,29 @@ with market_tab:
             "Ticker Symbol",
             placeholder="AAPL, Tesla, Nvidia, Microsoft, SPY …",
             label_visibility="collapsed",
-        ).strip().upper()
+        ).strip()  # keep original case so extract_ticker's LLM path handles company names
     with col_period:
         history_period = st.selectbox("Period", ["1mo", "3mo", "6mo", "1y"], index=0, label_visibility="collapsed")
 
     lookup_btn = st.button("🔍 Look Up", type="primary")
 
     if lookup_btn and ticker_input:
+        log.info("Market | input=%r", ticker_input)
         with st.spinner(f"Resolving {ticker_input}…"):
             resolved = _resolve_ticker(ticker_input)
+        log.info("Market | resolved=%s", resolved)
         with st.spinner(f"Fetching {resolved}…"):
             data = _fetch_stock_info(resolved)
             if data:
                 hist = yf.Ticker(resolved).history(period=history_period)
                 analysis = _market_agent().run(resolved)
+                log.info("Market | %s | price=$%.2f | source=%s",
+                         resolved, data.get("price", 0), data.get("source", "?"))
                 st.session_state.market_data     = data
                 st.session_state.market_history  = hist
                 st.session_state.market_analysis = analysis
             else:
+                log.warning("Market | no data for %s", resolved)
                 st.session_state.market_data     = None
                 st.session_state.market_history  = None
                 st.session_state.market_analysis = None

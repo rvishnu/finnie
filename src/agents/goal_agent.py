@@ -22,15 +22,24 @@ Usage:
     print(result["metrics"])
 """
 
-import re
 import yaml
+from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from src.core.llm import load_llm
 from src.rag.retriever import get_retriever
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
 
 with open("config.yaml") as f:
     cfg = yaml.safe_load(f)
+
+class _GoalParams(BaseModel):
+    goal_amount:        float | None = Field(None, description="Target savings amount in dollars (e.g. 50000 for $50k)")
+    time_horizon_years: float | None = Field(None, description="Years until the goal (e.g. 5.0)")
+    current_savings:    float        = Field(0.0,  description="Amount already saved in dollars (0 if not mentioned)")
+
 
 # Annual return assumptions by risk profile
 RETURN_RATES = {
@@ -69,91 +78,21 @@ Plan:
 class GoalPlanningAgent:
 
     def __init__(self):
-        self.retriever = get_retriever()
-        self.llm       = load_llm()
+        self.retriever   = get_retriever()
+        self.llm         = load_llm()
+        self.chain       = PROMPT | self.llm | StrOutputParser()
+        self.goal_parser = self.llm.with_structured_output(_GoalParams)
 
     def _parse_goal_from_text(self, text: str) -> dict:
-        """
-        Extract goal_amount, time_horizon_years, and current_savings from natural language.
-        Falls back to LLM for ambiguous phrasing.
-        """
-        result = {"goal_amount": None, "time_horizon_years": None, "current_savings": 0.0}
-
-        # Dollar amounts: $50,000  /  $50k  /  50000 dollars
-        amount_matches = re.findall(
-            r'\$\s*([\d,]+(?:\.\d+)?)\s*([kKmM]?)\b'
-            r'|\b([\d,]+(?:\.\d+)?)\s*([kKmM]?)\s*(?:dollars?|usd)',
-            text,
+        """Extract goal_amount, time_horizon_years, and current_savings from natural language."""
+        parsed = self.goal_parser.invoke(
+            f"Extract the financial goal details from this text:\n\n{text}"
         )
-        parsed_amounts = []
-        for a, suf_a, b, suf_b in amount_matches:
-            raw = a or b
-            suf = (suf_a or suf_b).lower()
-            val = float(raw.replace(",", ""))
-            if suf == "k":
-                val *= 1_000
-            elif suf == "m":
-                val *= 1_000_000
-            parsed_amounts.append(val)
-
-        # Timeline: "5 years" / "18 months"
-        year_match  = re.search(r'\b(\d+(?:\.\d+)?)\s*years?\b',  text, re.IGNORECASE)
-        month_match = re.search(r'\b(\d+(?:\.\d+)?)\s*months?\b', text, re.IGNORECASE)
-
-        horizon_years = None
-        if year_match:
-            horizon_years = float(year_match.group(1))
-        elif month_match:
-            horizon_years = float(month_match.group(1)) / 12
-
-        # "I have $X saved" / "already saved $X" / "current savings of $X"
-        saved_match = re.search(
-            r'(?:i\s+have|already\s+saved?|current\s+savings?\s+of?|saved?)\s+\$?\s*([\d,]+(?:\.\d+)?)\s*([kKmM]?)',
-            text, re.IGNORECASE,
-        )
-        current_savings = 0.0
-        if saved_match:
-            raw = float(saved_match.group(1).replace(",", ""))
-            suf = saved_match.group(2).lower()
-            if suf == "k":
-                raw *= 1_000
-            elif suf == "m":
-                raw *= 1_000_000
-            current_savings = raw
-
-        if parsed_amounts and horizon_years is not None:
-            result["goal_amount"]        = parsed_amounts[0]
-            result["time_horizon_years"] = horizon_years
-            result["current_savings"]    = current_savings
-            return result
-
-        # LLM fallback
-        response = self.llm.invoke(
-            "Extract the financial goal details from this text. "
-            "Return ONLY three lines:\n"
-            "GOAL_AMOUNT: <number in dollars, no commas or symbols>\n"
-            "TIME_HORIZON_YEARS: <number>\n"
-            "CURRENT_SAVINGS: <number in dollars, 0 if not mentioned>\n\n"
-            "Text: " + text
-        ).content.strip()
-
-        for line in response.splitlines():
-            if ":" not in line:
-                continue
-            key, _, val = line.partition(":")
-            key = key.strip().upper()
-            try:
-                num = float(val.strip().replace(",", ""))
-            except ValueError:
-                continue
-            if key == "GOAL_AMOUNT":
-                result["goal_amount"] = num
-            elif key == "TIME_HORIZON_YEARS":
-                result["time_horizon_years"] = num
-            elif key == "CURRENT_SAVINGS":
-                result["current_savings"] = num
-
-        return result
+        return {
+            "goal_amount":        parsed.goal_amount,
+            "time_horizon_years": parsed.time_horizon_years,
+            "current_savings":    parsed.current_savings or 0.0,
+        }
 
     def _calculate_metrics(
         self,
@@ -246,6 +185,10 @@ class GoalPlanningAgent:
                 "error":   str | None
             }
         """
+        log.info("GoalPlanningAgent | goal=%s | horizon=%s yr | risk=%s",
+                 f"${goal_amount:,.0f}" if goal_amount else "unknown",
+                 time_horizon_years or "?",
+                 risk_profile)
         annual_return = RETURN_RATES.get(risk_profile, RETURN_RATES["moderate"])
 
         if goal_amount is None or time_horizon_years is None:
@@ -282,14 +225,15 @@ class GoalPlanningAgent:
         rag_query   = query or f"saving {goal_amount} dollars in {time_horizon_years} years"
         context     = self._get_rag_context(rag_query)
 
-        chain  = PROMPT | self.llm | StrOutputParser()
-        answer = chain.invoke({
+        answer = self.chain.invoke({
             "metrics":           metrics_str,
             "context":           context,
             "risk_profile":      risk_profile,
             "annual_return_pct": metrics["annual_return_pct"],
         })
 
+        log.info("GoalPlanningAgent | done | monthly_with_growth=$%.0f | monthly_no_growth=$%.0f",
+                 metrics["monthly_with_growth"], metrics["monthly_no_growth"])
         return {
             "answer":  answer,
             "metrics": metrics,

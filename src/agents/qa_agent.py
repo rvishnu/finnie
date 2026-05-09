@@ -16,6 +16,9 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from src.core.llm import load_llm
 from src.rag.retriever import get_retriever
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
 
 PROMPT = ChatPromptTemplate.from_template("""
 You are Finnie, a friendly financial advisor application.
@@ -85,8 +88,10 @@ class FinanceQAAgent:
                 "citations": [{"title": ..., "url": ..., "source": ...}]
             }
         """
+        log.info("FinanceQAAgent | query=%r", query[:60])
         answer    = self.chain.invoke(query)
         citations = self._get_citations(query)
+        log.info("FinanceQAAgent | done | citations=%d", len(citations))
         return {
             "answer":    answer,
             "citations": citations,

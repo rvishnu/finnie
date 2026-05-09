@@ -52,7 +52,7 @@ def _make_st_mock():
     return st
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def helpers():
     """
     Import src.web_app.app with all external deps mocked.
@@ -107,10 +107,6 @@ class TestParseHoldings:
         result = helpers._parse_holdings("AAPL: 10, MSFT: 5, BND: 20, QQQ: 8, NVDA: 3")
         assert len(result) == 5
         assert result["BND"] == 20
-
-    def test_lowercase_normalized_to_upper(self, helpers):
-        result = helpers._parse_holdings("aapl: 10")
-        assert "AAPL" in result
 
     def test_float_shares_truncated_to_int(self, helpers):
         assert helpers._parse_holdings("AAPL: 10.7")["AAPL"] == 10
@@ -244,10 +240,11 @@ def _run_app() -> AppTest:
     """Run the app with all agent calls mocked and return the AppTest instance."""
     at = AppTest.from_file(APP_PATH, default_timeout=30)
     with (
-        patch("src.web_app.app.chat_invoke",  return_value=_CHAT_RESULT),
+        patch("src.web_app.app.chat_invoke",    return_value=_CHAT_RESULT),
         patch("src.web_app.app._portfolio_agent") as mock_pa,
-        patch("src.web_app.app._market_agent")   as mock_ma,
+        patch("src.web_app.app._market_agent")    as mock_ma,
         patch("src.web_app.app._fetch_stock_info", return_value=None),
+        patch("src.web_app.app._resolve_tickers", side_effect=lambda h: h),
     ):
         mock_pa.return_value.run.return_value = _PORTFOLIO_RESULT
         mock_ma.return_value.run.return_value = _MARKET_RESULT
@@ -298,7 +295,7 @@ class TestAppIntegration:
         ):
             at.run()
             old_thread = at.session_state["thread_id"]
-            at.button[0].click().run()   # "🔄 New Conversation" is the first button
+            next(b for b in at.button if "New Conversation" in b.label).click().run()
         assert at.session_state["chat_history"] == []
         assert at.session_state["thread_id"] != old_thread
 
@@ -338,6 +335,7 @@ class TestAppIntegration:
             patch("src.web_app.app._portfolio_agent") as mock_pa,
             patch("src.web_app.app._market_agent"),
             patch("src.web_app.app._fetch_stock_info", return_value=None),
+            patch("src.web_app.app._resolve_tickers", side_effect=lambda h: h),
         ):
             mock_pa.return_value.run.return_value = _PORTFOLIO_RESULT
             at.run()
@@ -347,19 +345,22 @@ class TestAppIntegration:
         assert at.session_state["portfolio_result"] is not None
 
     def test_portfolio_agent_called_with_correct_holdings(self):
+        import streamlit as st
+        st.cache_resource.clear()   # evict any real agent cached by a prior test
         at = AppTest.from_file(APP_PATH, default_timeout=30)
         with (
-            patch("src.web_app.app.chat_invoke",  return_value=_CHAT_RESULT),
-            patch("src.web_app.app._portfolio_agent") as mock_pa,
+            patch("src.workflow.graph.invoke",    return_value=_CHAT_RESULT),
+            patch("src.agents.portfolio_agent.PortfolioAnalysisAgent") as mock_cls,
             patch("src.web_app.app._market_agent"),
             patch("src.web_app.app._fetch_stock_info", return_value=None),
+            patch("src.web_app.app._resolve_tickers", side_effect=lambda h: h),
         ):
-            mock_pa.return_value.run.return_value = _PORTFOLIO_RESULT
+            mock_cls.return_value.run.return_value = _PORTFOLIO_RESULT
             at.run()
             at.text_area[0].input("AAPL: 10, MSFT: 5")
             analyze_btn = next(b for b in at.button if "Analyze" in b.label)
             analyze_btn.click().run()
-            call_kwargs = mock_pa.return_value.run.call_args[1]
+            call_kwargs = mock_cls.return_value.run.call_args[1]
         assert call_kwargs["portfolio"] == {"AAPL": 10, "MSFT": 5}
 
     # ── Chat tab ──────────────────────────────────────────────────────────────
@@ -367,7 +368,7 @@ class TestAppIntegration:
     def test_chat_calls_workflow_and_appends_history(self):
         at = AppTest.from_file(APP_PATH, default_timeout=30)
         with (
-            patch("src.web_app.app.chat_invoke",  return_value=_CHAT_RESULT) as mock_invoke,
+            patch("src.workflow.graph.invoke",    return_value=_CHAT_RESULT) as mock_invoke,
             patch("src.web_app.app._portfolio_agent"),
             patch("src.web_app.app._market_agent"),
             patch("src.web_app.app._fetch_stock_info", return_value=None),
