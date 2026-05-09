@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "finnie": {
+      "command": "uv",
+      "args": ["run", "python", "src/mcp_server/server.py"],
+      "cwd": "/Users/vishnu/PycharmProjects/IK/python/finnie"
+    }
+  }
+}

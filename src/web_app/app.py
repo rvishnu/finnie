@@ -28,6 +28,11 @@ import yfinance as yf
 
 from src.workflow.graph import invoke as chat_invoke
 from src.agents.portfolio_agent import PortfolioAnalysisAgent
+from src.utils.market_tools import _fetch_alpha_vantage, _fetch_yfinance
+
+
+def _fetch_stock_info(ticker: str) -> dict | None:
+    return _fetch_alpha_vantage(ticker) or _fetch_yfinance(ticker)
 
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -108,40 +113,6 @@ def _parse_holdings(text: str) -> dict[str, int]:
             i += 1
 
     return holdings
-
-
-def _fetch_stock_info(ticker: str) -> dict | None:
-    """Fetch structured stock data via yfinance."""
-    try:
-        info = yf.Ticker(ticker).info
-        if not info or info.get("regularMarketPrice") is None:
-            return None
-        price = (
-            info.get("regularMarketPrice")
-            or info.get("currentPrice")
-            or info.get("previousClose")
-            or 0
-        )
-        return {
-            "ticker":         ticker.upper(),
-            "name":           info.get("shortName") or info.get("longName") or ticker,
-            "price":          float(price),
-            "change":         float(info.get("regularMarketChange", 0)),
-            "change_pct":     float(info.get("regularMarketChangePercent", 0)),
-            "volume":         int(info.get("regularMarketVolume", 0)),
-            "high":           float(info.get("regularMarketDayHigh", 0)),
-            "low":            float(info.get("regularMarketDayLow", 0)),
-            "prev_close":     float(info.get("previousClose", 0)),
-            "week_52_high":   info.get("fiftyTwoWeekHigh"),
-            "week_52_low":    info.get("fiftyTwoWeekLow"),
-            "market_cap":     info.get("marketCap"),
-            "pe_ratio":       info.get("trailingPE"),
-            "dividend_yield": info.get("dividendYield"),
-            "sector":         info.get("sector", "N/A"),
-            "description":    (info.get("longBusinessSummary") or "")[:500],
-        }
-    except Exception:
-        return None
 
 
 def _fmt_large(n) -> str:

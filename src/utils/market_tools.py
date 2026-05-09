@@ -55,22 +55,31 @@ def _fetch_alpha_vantage(ticker: str) -> dict | None:
         }, timeout=10)
         overview = overview_resp.json() if overview_resp.ok else {}
 
+        def _to_float(val) -> float | None:
+            try:
+                f = float(str(val).rstrip("%"))
+                return f if f != 0.0 else None
+            except (TypeError, ValueError):
+                return None
+
+        raw_pct = quote.get("10. change percent", "0%")
         return {
             "ticker":        ticker.upper(),
+            "name":          overview.get("Name") or ticker.upper(),
             "price":         float(quote.get("05. price", 0)),
             "change":        float(quote.get("09. change", 0)),
-            "change_pct":    quote.get("10. change percent", "N/A"),
+            "change_pct":    _to_float(raw_pct) or 0.0,
             "volume":        int(quote.get("06. volume", 0)),
             "high":          float(quote.get("03. high", 0)),
             "low":           float(quote.get("04. low", 0)),
             "prev_close":    float(quote.get("08. previous close", 0)),
-            "week_52_high":  float(overview.get("52WeekHigh", 0)) or None,
-            "week_52_low":   float(overview.get("52WeekLow", 0)) or None,
-            "market_cap":    overview.get("MarketCapitalization", "N/A"),
-            "pe_ratio":      overview.get("PERatio", "N/A"),
-            "dividend_yield":overview.get("DividendYield", "N/A"),
+            "week_52_high":  _to_float(overview.get("52WeekHigh")),
+            "week_52_low":   _to_float(overview.get("52WeekLow")),
+            "market_cap":    _to_float(overview.get("MarketCapitalization")),
+            "pe_ratio":      _to_float(overview.get("PERatio")),
+            "dividend_yield":_to_float(overview.get("DividendYield")),
             "sector":        overview.get("Sector", "N/A"),
-            "description":   overview.get("Description", "")[:300],
+            "description":   overview.get("Description", "")[:500],
             "source":        "Alpha Vantage",
         }
 
@@ -99,20 +108,21 @@ def _fetch_yfinance(ticker: str) -> dict | None:
 
         return {
             "ticker":        ticker.upper(),
+            "name":          info.get("shortName") or info.get("longName") or ticker.upper(),
             "price":         float(price or 0),
             "change":        float(info.get("regularMarketChange", 0)),
-            "change_pct":    f"{info.get('regularMarketChangePercent', 0):.2f}%",
+            "change_pct":    float(info.get("regularMarketChangePercent", 0)),
             "volume":        int(info.get("regularMarketVolume", 0)),
             "high":          float(info.get("regularMarketDayHigh", 0)),
             "low":           float(info.get("regularMarketDayLow", 0)),
             "prev_close":    float(info.get("previousClose", 0)),
             "week_52_high":  info.get("fiftyTwoWeekHigh"),
             "week_52_low":   info.get("fiftyTwoWeekLow"),
-            "market_cap":    info.get("marketCap", "N/A"),
-            "pe_ratio":      info.get("trailingPE", "N/A"),
-            "dividend_yield":info.get("dividendYield", "N/A"),
+            "market_cap":    info.get("marketCap"),
+            "pe_ratio":      info.get("trailingPE"),
+            "dividend_yield":info.get("dividendYield"),
             "sector":        info.get("sector", "N/A"),
-            "description":   (info.get("longBusinessSummary") or "")[:300],
+            "description":   (info.get("longBusinessSummary") or "")[:500],
             "source":        "Yahoo Finance",
         }
 
@@ -180,7 +190,7 @@ def get_stock_data(ticker: str) -> str:
     lines = [
         f"Stock Data for {data['ticker']} (Source: {data['source']})",
         f"Price:          ${data['price']:.2f}",
-        f"Change:         {data['change']:+.2f} ({data['change_pct']})",
+        f"Change:         {data['change']:+.2f} ({data['change_pct']:+.2f}%)",
         f"Day High/Low:   ${data['high']:.2f} / ${data['low']:.2f}",
         f"Prev Close:     ${data['prev_close']:.2f}",
         f"Volume:         {data['volume']:,}",
