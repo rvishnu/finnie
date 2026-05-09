@@ -97,7 +97,15 @@ def answer_finance_question(
     compound interest, index funds, diversification, ETFs, bonds, etc.
     """
     result = _load()["qa"].run(query)
-    return result.get("answer", "")
+    answer = result.get("answer", "")
+    citations = result.get("citations", [])
+    if citations:
+        sources = "\n".join(
+            f"- {c['title']}" + (f": {c['url']}" if c.get("url") else "")
+            for c in citations
+        )
+        return f"{answer}\n\nSources:\n{sources}"
+    return answer
 
 
 @tool

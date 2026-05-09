@@ -9,11 +9,12 @@ Usage:
 """
 
 import os
+import time
 import requests
 import yfinance as yf
 import re
 
-
+from functools import wraps
 from langchain_core.tools import tool
 from dotenv import load_dotenv
 
@@ -22,9 +23,29 @@ load_dotenv()
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
 
+_CACHE: dict[str, tuple] = {}
+_CACHE_TTL = 1800  # 30 minutes
+
+
+def _with_cache(fn):
+    """Cache non-None return values by ticker for _CACHE_TTL seconds."""
+    @wraps(fn)
+    def wrapper(ticker: str):
+        key = f"{fn.__name__}:{ticker.upper()}"
+        if key in _CACHE:
+            value, ts = _CACHE[key]
+            if time.time() - ts < _CACHE_TTL:
+                return value
+        result = fn(ticker)
+        if result is not None:
+            _CACHE[key] = (result, time.time())
+        return result
+    return wrapper
+
 
 # ── Alpha Vantage ─────────────────────────────────────────────────────────────
 
+@_with_cache
 def _fetch_alpha_vantage(ticker: str) -> dict | None:
     """Fetch stock data from Alpha Vantage. Returns None on any failure."""
     if not ALPHA_VANTAGE_KEY:
@@ -90,6 +111,7 @@ def _fetch_alpha_vantage(ticker: str) -> dict | None:
 
 # ── yFinance ──────────────────────────────────────────────────────────────────
 
+@_with_cache
 def _fetch_yfinance(ticker: str) -> dict | None:
     """Fetch stock data from yfinance. Returns None on any failure."""
     try:

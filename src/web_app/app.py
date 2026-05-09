@@ -15,6 +15,7 @@ import re
 import sys
 import uuid
 from pathlib import Path
+import streamlit.components.v1 as components
 
 # Ensure the project root is on sys.path so `src.*` imports resolve
 # regardless of how Streamlit is launched (streamlit run, uv run, etc.)
@@ -28,6 +29,7 @@ import yfinance as yf
 
 from src.workflow.graph import invoke as chat_invoke
 from src.agents.portfolio_agent import PortfolioAnalysisAgent
+from src.agents.market_agent import MarketAnalysisAgent
 from src.utils.market_tools import _fetch_alpha_vantage, _fetch_yfinance
 
 
@@ -70,6 +72,8 @@ if "market_data" not in st.session_state:
     st.session_state.market_data = None
 if "market_history" not in st.session_state:
     st.session_state.market_history = None
+if "market_analysis" not in st.session_state:
+    st.session_state.market_analysis = None
 
 
 # ── Cached singletons ─────────────────────────────────────────────────────────
@@ -78,27 +82,30 @@ if "market_history" not in st.session_state:
 def _portfolio_agent() -> PortfolioAnalysisAgent:
     return PortfolioAnalysisAgent()
 
+@st.cache_resource
+def _market_agent() -> MarketAnalysisAgent:
+    return MarketAnalysisAgent()
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _parse_holdings(text: str) -> dict[str, int]:
     """
-    Parse user-entered holdings into {TICKER: shares}.
-    Accepts:  AAPL: 10, MSFT: 5        (colon format)
-              AAPL 10  MSFT 5           (space format)
-              10 AAPL, 5 MSFT          (shares-first format)
+    Parse user-entered holdings into {name_or_ticker: shares}.
+    Accepts tickers (AAPL) and company names (Apple, Microsoft).
+    Call _resolve_tickers() afterwards to normalise names to symbols.
     """
     holdings: dict[str, int] = {}
 
-    # Colon format: AAPL: 10
-    for m in re.finditer(r'\b([A-Z]{1,5})\s*:\s*(\d+(?:\.\d+)?)\b', text.upper()):
-        holdings[m.group(1)] = int(float(m.group(2)))
+    # Colon format: AAPL: 10  or  Apple: 10  or  Microsoft: 5
+    for m in re.finditer(r'\b([A-Za-z][A-Za-z0-9]{0,19})\s*:\s*(\d+(?:\.\d+)?)\b', text):
+        holdings[m.group(1).upper()] = int(float(m.group(2)))
     if holdings:
         return holdings
 
-    # Shares-first: 10 AAPL, 5 MSFT
-    for m in re.finditer(r'\b(\d+(?:\.\d+)?)\s+([A-Z]{1,5})\b', text.upper()):
-        holdings[m.group(2)] = int(float(m.group(1)))
+    # Shares-first: 10 AAPL, 5 Microsoft
+    for m in re.finditer(r'\b(\d+(?:\.\d+)?)\s+([A-Za-z][A-Za-z0-9]{0,19})\b', text):
+        holdings[m.group(2).upper()] = int(float(m.group(1)))
     if holdings:
         return holdings
 
@@ -113,6 +120,21 @@ def _parse_holdings(text: str) -> dict[str, int]:
             i += 1
 
     return holdings
+
+
+@st.cache_data(ttl=3600)
+def _resolve_ticker(name: str) -> str:
+    """Resolve a ticker, company name, or misspelling to a canonical ticker.
+    Uses LLM to infer intent before searching, so typos like 'aple' → 'AAPL' work.
+    """
+    from src.core.llm import load_llm
+    from src.utils.market_tools import extract_ticker
+    return extract_ticker(name, load_llm()) or name
+
+
+def _resolve_tickers(holdings: dict[str, int]) -> dict[str, int]:
+    """Resolve any company-name keys to ticker symbols."""
+    return {_resolve_ticker(k): v for k, v in holdings.items()}
 
 
 def _fmt_large(n) -> str:
@@ -211,19 +233,25 @@ with chat_tab:
         with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["content"])
 
+    # Scroll to the latest message after every rerun
+    if st.session_state.chat_history:
+        components.html("""
+        <script>
+            setTimeout(() => {
+                const app = window.parent.document.querySelector('[data-testid="stAppViewContainer"]');
+                if (app) app.scrollTop = app.scrollHeight;
+            }, 100);
+        </script>
+        """, height=0)
+
     # User input
     if prompt := st.chat_input("Ask Finnie anything about your finances…"):
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant", avatar="💰"):
-            with st.spinner("Finnie is thinking…"):
-                result = chat_invoke(prompt, thread_id=st.session_state.thread_id)
-                answer = result["answer"]
-            st.markdown(answer)
-
+        with st.spinner("Finnie is thinking…"):
+            result = chat_invoke(prompt, thread_id=st.session_state.thread_id)
+            answer = result["answer"]
+        st.session_state.chat_history.append({"role": "user",      "content": prompt})
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
+        st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -261,6 +289,8 @@ with portfolio_tab:
             if not holdings:
                 st.error("Could not parse holdings. Try: AAPL: 10, MSFT: 5")
             else:
+                with st.spinner("Resolving tickers…"):
+                    holdings = _resolve_tickers(holdings)
                 with st.spinner(f"Fetching live data for {', '.join(holdings.keys())}…"):
                     result = _portfolio_agent().run(
                         portfolio=holdings,
@@ -373,7 +403,7 @@ with market_tab:
     with col_search:
         ticker_input = st.text_input(
             "Ticker Symbol",
-            placeholder="AAPL, TSLA, NVDA, MSFT, SPY …",
+            placeholder="AAPL, Tesla, Nvidia, Microsoft, SPY …",
             label_visibility="collapsed",
         ).strip().upper()
     with col_period:
@@ -382,16 +412,21 @@ with market_tab:
     lookup_btn = st.button("🔍 Look Up", type="primary")
 
     if lookup_btn and ticker_input:
-        with st.spinner(f"Fetching {ticker_input}…"):
-            data = _fetch_stock_info(ticker_input)
+        with st.spinner(f"Resolving {ticker_input}…"):
+            resolved = _resolve_ticker(ticker_input)
+        with st.spinner(f"Fetching {resolved}…"):
+            data = _fetch_stock_info(resolved)
             if data:
-                hist = yf.Ticker(ticker_input).history(period=history_period)
-                st.session_state.market_data    = data
-                st.session_state.market_history = hist
+                hist = yf.Ticker(resolved).history(period=history_period)
+                analysis = _market_agent().run(resolved)
+                st.session_state.market_data     = data
+                st.session_state.market_history  = hist
+                st.session_state.market_analysis = analysis
             else:
-                st.session_state.market_data    = None
-                st.session_state.market_history = None
-                st.error(f"Could not find data for **{ticker_input}**. Check the ticker symbol and try again.")
+                st.session_state.market_data     = None
+                st.session_state.market_history  = None
+                st.session_state.market_analysis = None
+                st.error(f"Could not find data for **{resolved}**. Check the ticker symbol and try again.")
 
     # ── Display market data ────────────────────────────────────────────────────
     data = st.session_state.market_data
@@ -513,6 +548,14 @@ with market_tab:
             with st.expander("About the Company"):
                 st.write(data["description"])
 
+        # ── AI analysis ───────────────────────────────────────────────────────
+        analysis = st.session_state.market_analysis
+        if analysis:
+            with st.expander("📝 Finnie's Analysis", expanded=True):
+                st.markdown(analysis.get("answer", ""))
+                if analysis.get("source"):
+                    st.caption(f"Data source: {analysis['source']}")
+
     elif not (lookup_btn and ticker_input):
         # Empty state
         st.info(
@@ -529,6 +572,8 @@ with market_tab:
                     with st.spinner(f"Fetching {qt}…"):
                         d = _fetch_stock_info(qt)
                         h = yf.Ticker(qt).history(period="1mo") if d else None
-                        st.session_state.market_data    = d
-                        st.session_state.market_history = h
+                        a = _market_agent().run(qt) if d else None
+                        st.session_state.market_data     = d
+                        st.session_state.market_history  = h
+                        st.session_state.market_analysis = a
                     st.rerun()

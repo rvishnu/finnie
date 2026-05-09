@@ -42,6 +42,8 @@ RETURN_RATES = {
 PROMPT = ChatPromptTemplate.from_template("""
 You are Finnie, a friendly financial education assistant.
 Help the user understand their savings goal and how to achieve it.
+If they didn't provide how much money the already have, just ask them what they have.
+If any information is missing, ask the user for it in a friendly way.
 Be encouraging and honest. Always end with a disclaimer that this is educational, not financial advice.
 
 Goal Metrics:
@@ -234,7 +236,7 @@ class GoalPlanningAgent:
             query:               Natural language description of the goal.
             goal_amount:         Target savings amount in dollars.
             time_horizon_years:  Years until the goal.
-            current_savings:     Amount already saved (default 0).
+            current_savings:     Amount already saved (default 0). 
             risk_profile:        "conservative" | "moderate" | "aggressive"
 
         Returns:
