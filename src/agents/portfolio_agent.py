@@ -148,26 +148,26 @@ class PortfolioAnalysisAgent:
     def _format_metrics_for_llm(self, metrics: dict) -> str:
         """Convert metrics dict to a readable string for the prompt."""
         lines = [
-            f"Total Portfolio Value: ${metrics['total_value']:,.2f}",
-            f"Number of Positions:   {metrics['num_positions']}",
-            f"Diversification Score: {metrics['diversification_score']}/10",
+            f"Total Portfolio Value: ${metrics.get('total_value', 0):,.2f}",
+            f"Number of Positions:   {metrics.get('num_positions', 0)}",
+            f"Diversification Score: {metrics.get('diversification_score', 0)}/10",
             "",
             "Holdings:",
         ]
-        for h in metrics["holdings"]:
+        for h in metrics.get("holdings", []):
             lines.append(
-                f"  {h['ticker']} ({h['name']}): "
-                f"{h['shares']} shares @ ${h['price']:.2f} = "
-                f"${h['position_value']:,.2f} ({h['allocation_pct']}%) "
-                f"[{h['sector']}]"
+                f"  {h.get('ticker','?')} ({h.get('name','?')}): "
+                f"{h.get('shares',0)} shares @ ${h.get('price',0):.2f} = "
+                f"${h.get('position_value',0):,.2f} ({h.get('allocation_pct',0)}%) "
+                f"[{h.get('sector','Unknown')}]"
             )
         lines.append("")
         lines.append("Sector Breakdown:")
-        for sector, pct in metrics["sector_pct"].items():
+        for sector, pct in metrics.get("sector_pct", {}).items():
             lines.append(f"  {sector}: {pct}%")
         lines.append("")
         lines.append("Asset Type Breakdown:")
-        for atype, pct in metrics["asset_pct"].items():
+        for atype, pct in metrics.get("asset_pct", {}).items():
             lines.append(f"  {atype}: {pct}%")
         return "\n".join(lines)
 
@@ -230,7 +230,13 @@ class PortfolioAnalysisAgent:
                 "failed":  failed,
             }
 
-        metrics     = self._calculate_metrics(holdings)
+        metrics = self._calculate_metrics(holdings)
+        if not metrics:
+            return {
+                "answer": "Could not calculate portfolio metrics — all position prices returned as zero. Please check your ticker symbols.",
+                "metrics": {},
+                "failed":  failed,
+            }
         metrics_str = self._format_metrics_for_llm(metrics)
         rag_query   = query or "portfolio diversification asset allocation risk"
         context     = self._get_rag_context(rag_query)

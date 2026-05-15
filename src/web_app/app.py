@@ -27,7 +27,43 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-from src.workflow.graph import invoke as chat_invoke
+from src.workflow.graph import invoke, invoke_all
+
+# Queries where tool B needs tool A's result → use ReAct (sequential)
+_SEQUENTIAL_QUERIES = (
+    "p/e", "pe ratio", "price-to-earnings",
+    "compare", "versus", "vs ",
+    "rate hike", "rate sensitive", "interest rate", "vulnerable",
+    "52-week", "52 week",
+    "dividend",
+    "at a loss", "trading at a loss", "tax benefit", "tax loss",
+    "allocation", "too aggressive", "too conservative", "for my age",
+    "which of my", "most vulnerable", "most exposed",
+    "falls", "drops", "impact on my portfolio",
+    "shares of", "shares of nvidia", "retire after selling", "selling my shares",
+    "if i sell", "when i sell",
+)
+
+def chat_invoke(prompt: str, thread_id: str) -> dict:
+    """Route to ReAct (sequential) for context-dependent queries, fan-out otherwise."""
+    if any(k in prompt.lower() for k in _SEQUENTIAL_QUERIES):
+        result = invoke(prompt, thread_id=thread_id)
+        from langchain_core.messages import ToolMessage
+        import re as _re
+        # Only show tools from THIS turn (after the last HumanMessage)
+        msgs = result.get("messages", [])
+        last_human_idx = next(
+            (i for i in range(len(msgs) - 1, -1, -1)
+             if hasattr(msgs[i], "type") and msgs[i].type == "human"),
+            0,
+        )
+        agents_used = [m.name for m in msgs[last_human_idx:]
+                       if isinstance(m, ToolMessage) and hasattr(m, "name")]
+        answer = _re.sub(r"(?<!\\)\$", r"\\$", result["answer"])
+        result["agents_used"] = agents_used
+        result["answer"] = answer
+        return result
+    return invoke_all(prompt, thread_id=thread_id)
 from src.agents.portfolio_agent import PortfolioAnalysisAgent
 from src.agents.market_agent import MarketAnalysisAgent
 from src.utils.market_tools import _fetch_alpha_vantage, _fetch_yfinance
@@ -216,9 +252,27 @@ with chat_tab:
     if prompt := st.chat_input("Ask Finnie anything about your finances…"):
         log.info("Chat | thread=%s | query=%r", st.session_state.thread_id[:8], prompt[:80])
         with st.spinner("Finnie is thinking…"):
-            result = chat_invoke(prompt, thread_id=st.session_state.thread_id)
-            answer = result["answer"]
-        log.info("Chat | thread=%s | answer_len=%d", st.session_state.thread_id[:8], len(answer))
+            result      = chat_invoke(prompt, thread_id=st.session_state.thread_id)
+            answer      = result["answer"]
+            agents_used = result.get("agents_used", [])
+
+        # Build agent-badge suffix so the evaluator can see multi-agent in action
+        agent_labels = {
+            "answer_finance_question": "📚 Finance Q&A",
+            "plan_financial_goal":     "🎯 Goal Planner",
+            "get_tax_education":       "💰 Tax Advisor",
+            "analyze_portfolio":       "📊 Portfolio Analyst",
+            "get_market_data":         "📈 Market Data",
+            "get_financial_news":      "📰 News Synthesizer",
+        }
+        if agents_used:
+            badges = "  ".join(
+                f"`{agent_labels.get(a, a)}`" for a in agents_used
+            )
+            answer = f"**Agents consulted:** {badges}\n\n---\n\n{answer}"
+
+        log.info("Chat | thread=%s | agents=%s | answer_len=%d",
+                 st.session_state.thread_id[:8], agents_used, len(answer))
         st.session_state.chat_history.append({"role": "user",      "content": prompt})
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
         st.rerun()

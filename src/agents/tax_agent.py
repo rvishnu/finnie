@@ -83,8 +83,12 @@ class _TaxQuery(BaseModel):
                         description="Tax scenario: capital_gains for sale/gain/profit, "
                                     "account_limits for IRA/401k/HSA contributions, "
                                     "tax_loss for harvesting losses, general otherwise")
-    gain_or_loss:   float | None = Field(None, description="Dollar amount of gain or loss")
-    holding_months: int   | None = Field(None, description="Holding period in months (12 months = 1 year)")
+    gain_or_loss:   float | None = Field(None, description="Dollar amount of gain or loss. Return null if not explicitly stated as a dollar amount.")
+    holding_months: int   | None = Field(None, description=(
+        "Holding period in months (12 months = 1 year). "
+        "If the user says 'long ago', 'years ago', 'a few years', 'many years', 'long time', use 999. "
+        "Return null only if no holding period information is mentioned at all."
+    ))
     bracket:        str          = Field("22%", description="Income tax bracket e.g. '22%'. Default 22% if not mentioned")
     account_type:   str   | None = Field(None, description="Account type: 401k, roth_ira, ira, or hsa")
 
@@ -211,6 +215,19 @@ class TaxEducationAgent:
         log.info("TaxEducationAgent | scenario=%s | query=%r", scenario, query[:60])
 
         if scenario == "capital_gains":
+            if parsed.gain_or_loss is None:
+                return {
+                    "answer": (
+                        "To calculate your capital gains tax I need two numbers:\n"
+                        "1. Your **purchase price per share** (what you paid when you bought)\n"
+                        "2. Your **selling price per share** (or I can look up the current price)\n\n"
+                        "For example: 'I bought NVDA at $50 per share and am selling at the current price.' "
+                        "Once I have that, I can calculate your exact gain and tax."
+                    ),
+                    "metrics":  {},
+                    "scenario": "capital_gains",
+                    "error":    "missing_gain",
+                }
             metrics = self._calc_capital_gains(parsed)
         elif scenario == "account_limits":
             metrics = self._calc_account_limits(parsed)
