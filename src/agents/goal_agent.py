@@ -73,7 +73,7 @@ class _GoalParams(BaseModel):
     ))
     risk_profile:       str   | None = Field(None, description=(
         "User's risk tolerance. Map to one of: 'conservative', 'moderate', 'aggressive'. "
-        "Words like 'aggressive', 'high risk', 'risky' → 'aggressive'; "
+        "Words like 'aggressive', 'high risk', 'risky', 'more interest' → 'aggressive'; "
         "'moderate', 'balanced', 'medium' → 'moderate'; "
         "'conservative', 'safe', 'low risk' → 'conservative'. "
         "Return null if not mentioned."

@@ -198,6 +198,47 @@ def test_k_suffix_amount_parsed(agent):
 
 # ── NL parsing: tax-loss ──────────────────────────────────────────────────────
 
+def test_parses_loss_amount_from_query(agent):
+    result = agent.run("I have a $6,000 loss this year. Can I harvest it? 22% bracket.")
+    assert result["metrics"].get("total_loss") == 6_000.0
+
+
+def test_parses_loss_with_k_suffix(agent):
+    result = agent.run("I have a $4k loss this year. 24% bracket.")
+    assert result["metrics"].get("total_loss") == 4_000.0
+
+
+def test_tax_loss_carryforward_computed_correctly(agent):
+    result = agent.run("I have an $8,000 loss this year. 22% bracket.")
+    assert result["metrics"].get("carryforward_to_next") == 5_000.0
+
+
+# ── Holding-period override logic ─────────────────────────────────────────────
+
+def test_long_term_phrase_forces_long_term(agent):
+    result = agent.run("I sold stock long-term with a $5,000 gain. 22% bracket.")
+    assert result["metrics"].get("holding_type") == "long_term"
+
+
+def test_long_term_hyphenated_phrase_forces_long_term(agent):
+    result = agent.run("I made a long-term investment and sold with a $8,000 gain. 24% bracket.")
+    assert result["metrics"].get("holding_type") == "long_term"
+
+
+def test_year_based_purchase_yields_long_term(agent):
+    result = agent.run("I bought AAPL in 2023 with a $5,000 gain. 22% bracket.")
+    assert result["metrics"].get("holding_type") == "long_term"
+
+
+# ── missing_gain error path ────────────────────────────────────────────────────
+
+def test_capital_gains_without_amount_returns_missing_gain_error(agent):
+    result = agent.run("I sold AAPL stock but I'm not sure how much I made.")
+    assert result["error"] == "missing_gain"
+    assert result["scenario"] == "capital_gains"
+    assert len(result["answer"]) > 0
+    assert result["metrics"] == {}
+
 
 # ── Answer quality ────────────────────────────────────────────────────────────
 

@@ -20,6 +20,7 @@ Usage:
 """
 
 import re
+import yfinance as yf
 from datetime import date
 from typing import Literal
 from pydantic import BaseModel, Field
@@ -133,6 +134,19 @@ Explanation:
 """)
 
 
+def _fetch_current_price(ticker: str) -> float | None:
+    """Fetch live market price from yfinance for a single ticker."""
+    try:
+        info = yf.Ticker(ticker).info
+        return (
+            info.get("regularMarketPrice")
+            or info.get("currentPrice")
+            or info.get("previousClose")
+        )
+    except Exception:
+        return None
+
+
 class TaxEducationAgent:
 
     def __init__(self):
@@ -155,13 +169,18 @@ class TaxEducationAgent:
         if q.positions:
             total_gain = 0.0
             for pos in q.positions:
-                if pos.current_price is not None:
-                    stock_gain = (pos.current_price - pos.purchase_price) * pos.shares
+                current_price = pos.current_price
+                if current_price is None:
+                    current_price = _fetch_current_price(pos.ticker)
+                    if current_price:
+                        log.info("TaxEducationAgent | fetched live price %s=%.2f", pos.ticker, current_price)
+                if current_price is not None:
+                    stock_gain = (current_price - pos.purchase_price) * pos.shares
                     per_stock.append({
                         "ticker":         pos.ticker,
                         "shares":         pos.shares,
                         "purchase_price": pos.purchase_price,
-                        "current_price":  pos.current_price,
+                        "current_price":  current_price,
                         "gain":           round(stock_gain, 2),
                     })
                     total_gain += stock_gain
@@ -194,7 +213,7 @@ class TaxEducationAgent:
         }
 
     def _calc_tax_loss(self, q: _TaxQuery) -> dict:
-        loss                 = q.gain_or_loss or 0.0
+        loss                 = abs(q.gain_or_loss or 0.0)
         deductible_this_year = min(loss, 3_000)
         carryforward         = max(loss - 3_000, 0.0)
         rate                 = SHORT_TERM_RATE.get(q.bracket, 0.22)
@@ -292,7 +311,7 @@ class TaxEducationAgent:
         # ─────────────────────────────────────────────────────────────────────
 
         if scenario == "capital_gains":
-            if parsed.gain_or_loss is None:
+            if parsed.gain_or_loss is None and not parsed.positions:
                 return {
                     "answer": (
                         "To calculate your capital gains tax I need two numbers:\n"

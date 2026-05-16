@@ -255,3 +255,99 @@ def test_diversification_score_heavily_concentrated():
     sector_pct = {"Technology": 100.0}
     score = _diversification_score(holdings, sector_pct)
     assert score <= 3
+
+
+def test_diversification_score_three_to_four_holdings_penalised():
+    """3-4 holdings deducts 2 points (the elif < 5 branch)."""
+    holdings = [
+        {"ticker": "AAPL", "allocation_pct": 34, "asset_type": "Stock",   "sector": "Technology"},
+        {"ticker": "MSFT", "allocation_pct": 33, "asset_type": "Stock",   "sector": "Technology"},
+        {"ticker": "BND",  "allocation_pct": 33, "asset_type": "Bond ETF","sector": "Fixed Income"},
+    ]
+    sector_pct = {"Technology": 67.0, "Fixed Income": 33.0}
+    score = _diversification_score(holdings, sector_pct)
+    assert score <= 8
+
+
+def test_diversification_score_minor_concentration_deducts_one():
+    """A single position between 25-40% deducts only 1 point."""
+    holdings = [
+        {"ticker": "AAPL", "allocation_pct": 30, "asset_type": "Stock",   "sector": "Technology"},
+        {"ticker": "MSFT", "allocation_pct": 20, "asset_type": "Stock",   "sector": "Technology"},
+        {"ticker": "JNJ",  "allocation_pct": 20, "asset_type": "Stock",   "sector": "Healthcare"},
+        {"ticker": "BND",  "allocation_pct": 15, "asset_type": "Bond ETF","sector": "Fixed Income"},
+        {"ticker": "QQQ",  "allocation_pct": 15, "asset_type": "ETF",     "sector": "Technology"},
+    ]
+    sector_pct = {"Technology": 65.0, "Healthcare": 20.0, "Fixed Income": 15.0}
+    # 30% allocation → deducts 1 (not 3); 5 holdings → no holding count penalty
+    score = _diversification_score(holdings, sector_pct)
+    assert score >= 4
+
+
+def test_diversification_score_mild_sector_concentration_deducts_one():
+    """A sector between 40-60% deducts 1 point, not 3."""
+    holdings = [
+        {"ticker": "AAPL", "allocation_pct": 20, "asset_type": "Stock",   "sector": "Technology"},
+        {"ticker": "MSFT", "allocation_pct": 20, "asset_type": "Stock",   "sector": "Technology"},
+        {"ticker": "NVDA", "allocation_pct": 10, "asset_type": "Stock",   "sector": "Technology"},
+        {"ticker": "JNJ",  "allocation_pct": 25, "asset_type": "Stock",   "sector": "Healthcare"},
+        {"ticker": "BND",  "allocation_pct": 25, "asset_type": "Bond ETF","sector": "Fixed Income"},
+    ]
+    sector_pct = {"Technology": 50.0, "Healthcare": 25.0, "Fixed Income": 25.0}
+    score_sector_mild = _diversification_score(holdings, sector_pct)
+
+    # Compare against perfectly balanced to confirm only 1 point was lost for sector
+    balanced_sector_pct = {"Technology": 33.0, "Healthcare": 33.0, "Fixed Income": 34.0}
+    score_balanced = _diversification_score(holdings, balanced_sector_pct)
+    assert score_balanced - score_sector_mild == 1
+
+
+def test_diversification_score_no_bonds_deducts_one():
+    """Portfolio with no Bond ETF deducts 1 point vs identical portfolio that has one."""
+    base = [
+        {"ticker": "AAPL", "allocation_pct": 20, "asset_type": "Stock", "sector": "Technology"},
+        {"ticker": "MSFT", "allocation_pct": 20, "asset_type": "Stock", "sector": "Technology"},
+        {"ticker": "JNJ",  "allocation_pct": 20, "asset_type": "Stock", "sector": "Healthcare"},
+        {"ticker": "QQQ",  "allocation_pct": 20, "asset_type": "ETF",   "sector": "Technology"},
+        {"ticker": "AMZN", "allocation_pct": 20, "asset_type": "Stock", "sector": "Consumer Cyclical"},
+    ]
+    with_bonds = base[:-1] + [
+        {"ticker": "BND",  "allocation_pct": 20, "asset_type": "Bond ETF", "sector": "Fixed Income"},
+    ]
+    sector_pct_no_bonds   = {"Technology": 60.0, "Healthcare": 20.0, "Consumer Cyclical": 20.0}
+    sector_pct_with_bonds = {"Technology": 60.0, "Healthcare": 20.0, "Fixed Income": 20.0}
+    score_no_bonds   = _diversification_score(base,       sector_pct_no_bonds)
+    score_with_bonds = _diversification_score(with_bonds, sector_pct_with_bonds)
+    assert score_with_bonds - score_no_bonds == 1
+
+
+# ── _classify_asset: bond ETF ticker keywords ─────────────────────────────────
+
+def test_classify_asset_bond_etf_tlt():
+    assert _classify_asset("TLT", {"quoteType": "ETF", "shortName": "iShares 20+ Year Treasury Bond ETF"}) == "Bond ETF"
+
+
+def test_classify_asset_bond_etf_agg():
+    assert _classify_asset("AGG", {"quoteType": "ETF", "shortName": "iShares Core U.S. Aggregate Bond ETF"}) == "Bond ETF"
+
+
+def test_classify_asset_bond_etf_lqd():
+    assert _classify_asset("LQD", {"quoteType": "ETF", "shortName": "iShares iBoxx $ Investment Grade Corporate Bond ETF"}) == "Bond ETF"
+
+
+# ── Risk profile: moderate ────────────────────────────────────────────────────
+
+def test_risk_profile_moderate_in_answer(agent):
+    """Moderate risk profile produces a balanced-sounding analysis."""
+    result = agent.run(portfolio={"AAPL": 10, "BND": 10}, risk_profile="moderate")
+    answer = result["answer"].lower()
+    assert any(word in answer for word in ["moderate", "balanced", "risk", "diversif"])
+
+
+# ── NL parsing: company names ─────────────────────────────────────────────────
+
+def test_natural_language_company_name_parsing(agent):
+    """LLM resolves company names to tickers (Apple → AAPL, Microsoft → MSFT)."""
+    result = agent.run(query="I have 10 Apple shares and 5 Microsoft shares")
+    tickers = [h["ticker"] for h in result["metrics"].get("holdings", [])]
+    assert "AAPL" in tickers or "MSFT" in tickers
