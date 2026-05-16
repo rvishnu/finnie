@@ -27,7 +27,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-from src.workflow.graph import chat
+from src.workflow.graph import invoke as chat_invoke
 from src.agents.portfolio_agent import PortfolioAnalysisAgent
 from src.agents.market_agent import MarketAnalysisAgent
 from src.utils.market_tools import _fetch_alpha_vantage, _fetch_yfinance
@@ -216,7 +216,7 @@ with chat_tab:
     if prompt := st.chat_input("Ask Finnie anything about your finances…"):
         log.info("Chat | thread=%s | query=%r", st.session_state.thread_id[:8], prompt[:80])
         with st.spinner("Finnie is thinking…"):
-            result      = chat(prompt, thread_id=st.session_state.thread_id)
+            result      = chat_invoke(prompt, thread_id=st.session_state.thread_id)
             answer      = result["answer"]
             agents_used = result.get("agents_used", [])
 

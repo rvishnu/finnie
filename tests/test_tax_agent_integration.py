@@ -232,8 +232,28 @@ def test_year_based_purchase_yields_long_term(agent):
 
 # ── missing_gain error path ────────────────────────────────────────────────────
 
+def test_multi_stock_positions_fetches_live_prices(agent):
+    """When positions have no explicit sell price, agent fetches live prices and computes gains."""
+    result = agent.run(
+        "I have QQQM: 300 (bought at $100), RKLB: 200 (bought at $10). "
+        "Long-term holdings, 22% bracket. What if I sell today?"
+    )
+    assert result["error"] is None
+    assert result["scenario"] == "capital_gains"
+    assert result["metrics"].get("holding_type") == "long_term"
+    assert result["metrics"].get("gain", 0) > 0
+    per_stock = result["metrics"].get("per_stock", [])
+    tickers = [s["ticker"] for s in per_stock]
+    assert "QQQM" in tickers
+    assert "RKLB" in tickers
+    for s in per_stock:
+        assert s["current_price"] is not None
+        assert s["current_price"] > 0
+
+
 def test_capital_gains_without_amount_returns_missing_gain_error(agent):
-    result = agent.run("I sold AAPL stock but I'm not sure how much I made.")
+    # No ticker, no positions, no dollar amount — agent must ask for more info
+    result = agent.run("I want to sell some stocks for a profit but haven't decided which ones yet.")
     assert result["error"] == "missing_gain"
     assert result["scenario"] == "capital_gains"
     assert len(result["answer"]) > 0
