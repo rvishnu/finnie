@@ -19,6 +19,8 @@ Usage:
     print(result["metrics"])
 """
 
+import re
+from datetime import date
 from typing import Literal
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
@@ -78,16 +80,30 @@ ACCOUNT_LIMITS: dict[str, dict] = {
     },
 }
 
+class _StockPosition(BaseModel):
+    ticker:         str          = Field(description="Stock ticker symbol, e.g. AAPL")
+    shares:         float        = Field(description="Number of shares held")
+    purchase_price: float        = Field(description="Price paid per share when purchased")
+    current_price:  float | None = Field(None, description="Current or selling price per share if mentioned in context")
+
+
 class _TaxQuery(BaseModel):
     scenario:       Literal["capital_gains", "account_limits", "tax_loss", "general"] = Field(
                         description="Tax scenario: capital_gains for sale/gain/profit, "
                                     "account_limits for IRA/401k/HSA contributions, "
                                     "tax_loss for harvesting losses, general otherwise")
-    gain_or_loss:   float | None = Field(None, description="Dollar amount of gain or loss. Return null if not explicitly stated as a dollar amount.")
+    positions:      list[_StockPosition] | None = Field(None, description=(
+        "Extract each individual stock position when the user lists multiple stocks with shares and prices. "
+        "Populate current_price if a selling price or current market price is mentioned for that ticker. "
+        "Do NOT compute gains — just extract the raw numbers; Python will do the arithmetic."
+    ))
+    gain_or_loss:   float | None = Field(None, description=(
+        "Total dollar gain or loss ONLY if stated explicitly as a single dollar amount. "
+        "Leave null if individual stock positions are provided — gains will be computed from positions."
+    ))
     holding_months: int   | None = Field(None, description=(
         "Holding period in months (12 months = 1 year). "
-        "If the user says 'long ago', 'years ago', 'a few years', 'many years', 'long time', use 999. "
-        "Return null only if no holding period information is mentioned at all."
+        "Return null if not mentioned — the caller will resolve from year references."
     ))
     bracket:        str          = Field("22%", description="Income tax bracket e.g. '22%'. Default 22% if not mentioned")
     account_type:   str   | None = Field(None, description="Account type: 401k, roth_ira, ira, or hsa")
@@ -127,22 +143,46 @@ class TaxEducationAgent:
 
     # ── Calculators ───────────────────────────────────────────────────────────
 
-    def _calc_capital_gains(self, q: _TaxQuery) -> dict:
-        gain         = q.gain_or_loss or 0.0
-        is_long_term = q.holding_months is not None and q.holding_months >= 12
+    def _calc_capital_gains(self, q: _TaxQuery, holding_months: int | None = None) -> dict:
+        months       = holding_months if holding_months is not None else q.holding_months
+        is_long_term = months is not None and months >= 12
         holding_type = "long_term" if is_long_term else "short_term"
         tax_rate     = (LONG_TERM_RATE if is_long_term else SHORT_TERM_RATE).get(q.bracket, 0.15)
+
+        # Compute gain in Python from per-stock positions (avoids LLM arithmetic errors).
+        # Fall back to the stated gain_or_loss only when no positions are available.
+        per_stock: list[dict] = []
+        if q.positions:
+            total_gain = 0.0
+            for pos in q.positions:
+                if pos.current_price is not None:
+                    stock_gain = (pos.current_price - pos.purchase_price) * pos.shares
+                    per_stock.append({
+                        "ticker":         pos.ticker,
+                        "shares":         pos.shares,
+                        "purchase_price": pos.purchase_price,
+                        "current_price":  pos.current_price,
+                        "gain":           round(stock_gain, 2),
+                    })
+                    total_gain += stock_gain
+            gain = total_gain if per_stock else (q.gain_or_loss or 0.0)
+        else:
+            gain = q.gain_or_loss or 0.0
+
         estimated_tax = round(gain * tax_rate, 2)
-        return {
+        result = {
             "scenario":              "capital_gains",
             "gain":                  round(gain, 2),
-            "holding_period_months": q.holding_months,
+            "holding_period_months": months,
             "holding_type":          holding_type,
             "income_bracket":        q.bracket,
             "tax_rate_pct":          round(tax_rate * 100, 1),
             "estimated_tax":         estimated_tax,
             "net_gain":              round(gain - estimated_tax, 2),
         }
+        if per_stock:
+            result["per_stock"] = per_stock
+        return result
 
     def _calc_account_limits(self, q: _TaxQuery) -> dict:
         account = (q.account_type or "ira").lower().replace(" ", "_")
@@ -171,14 +211,27 @@ class TaxEducationAgent:
 
     def _format_metrics(self, metrics: dict) -> str:
         lines = []
+        currency_keys = {"tax", "gain", "loss", "saving", "net", "deductible", "carryforward", "price"}
         for k, v in metrics.items():
-            if k == "scenario":
+            if k in ("scenario", "per_stock"):
                 continue
             label = k.replace("_", " ").title()
             if isinstance(v, float):
-                lines.append(f"  {label}: ${v:,.2f}" if "tax" in k or "gain" in k or "loss" in k or "saving" in k or "net" in k or "deductible" in k or "carryforward" in k else f"  {label}: {v}")
+                lines.append(
+                    f"  {label}: USD {v:,.2f}"
+                    if any(ck in k for ck in currency_keys)
+                    else f"  {label}: {v}"
+                )
             else:
                 lines.append(f"  {label}: {v}")
+        if metrics.get("per_stock"):
+            lines.append("\n  Per-stock breakdown (Python-computed):")
+            for s in metrics["per_stock"]:
+                lines.append(
+                    f"    {s['ticker']}: {s['shares']:.0f} shares × "
+                    f"(USD {s['current_price']:,.2f} − USD {s['purchase_price']:,.2f}) "
+                    f"= USD {s['gain']:,.2f}"
+                )
         return "\n".join(lines)
 
     def _get_rag_context(self, query: str) -> str:
@@ -210,9 +263,33 @@ class TaxEducationAgent:
                 "error":    "no_input",
             }
 
-        parsed   = self.query_parser.invoke(query)
+        dated_query = f"[Today's date: {date.today().isoformat()}]\n{query}"
+        parsed   = self.query_parser.invoke(dated_query)
         scenario = parsed.scenario
         log.info("TaxEducationAgent | scenario=%s | query=%r", scenario, query[:60])
+
+        # ── Deterministic holding-period override ─────────────────────────────
+        # LLMs are unreliable at date arithmetic. Apply these rules in order:
+        # 1. Explicit "long term" phrase → definitely ≥ 12 months
+        # 2. Purchase year in text (e.g. "in 2023") → compute months from Jan of that year
+        # This overrides the LLM-parsed holding_months so long-term is never misclassified.
+        holding_months = parsed.holding_months
+        q_lower = query.lower()
+        _LONG_TERM_PHRASES = ("long term", "long-term", "more than a year", "over a year",
+                              "several years", "many years", "years ago")
+        if any(p in q_lower for p in _LONG_TERM_PHRASES):
+            holding_months = 999
+            log.info("TaxEducationAgent | holding_months=999 (long-term phrase detected)")
+        elif holding_months is None or holding_months < 12:
+            year_m = re.search(r'\b(20\d{2})\b', query)
+            if year_m:
+                purchase_year = int(year_m.group(1))
+                today = date.today()
+                computed = (today.year - purchase_year) * 12 + today.month
+                if computed > (holding_months or 0):
+                    holding_months = computed
+                    log.info("TaxEducationAgent | holding_months=%d (from year %d)", holding_months, purchase_year)
+        # ─────────────────────────────────────────────────────────────────────
 
         if scenario == "capital_gains":
             if parsed.gain_or_loss is None:
@@ -228,7 +305,7 @@ class TaxEducationAgent:
                     "scenario": "capital_gains",
                     "error":    "missing_gain",
                 }
-            metrics = self._calc_capital_gains(parsed)
+            metrics = self._calc_capital_gains(parsed, holding_months=holding_months)
         elif scenario == "account_limits":
             metrics = self._calc_account_limits(parsed)
         elif scenario == "tax_loss":

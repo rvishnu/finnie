@@ -42,14 +42,17 @@ from src.core.llm import load_llm
 from src.utils.logger import get_logger
 from src.workflow.state import FinnieState
 from src.workflow.tools import TOOLS
-from src.workflow.prompts import _system_prompt
+from src.workflow.prompts import _system_prompt, _synth_prompt
 
 log = get_logger(__name__)
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
-_TICKER_RE = re.compile(r'\b([A-Z]{1,5})\s*[:\-]\s*(\d+(?:\.\d+)?)\b')
+# "AAPL: 100" or "MSFT - 200"
+_TICKER_RE = re.compile(r'\b([A-Z]{2,5})\s*[:\-]\s*(\d+(?:\.\d+)?)\b')
+# "100 AAPL" or "1000 QQQ" — number-first format
+_TICKER_RE_REVERSE = re.compile(r'\b(\d+(?:\.\d+)?)\s+([A-Z]{2,5})\b')
 
 
 def param_extractor_node(state: FinnieState) -> dict:
@@ -68,8 +71,10 @@ def param_extractor_node(state: FinnieState) -> dict:
     text = str(last_human.content)
     updates: dict = {}
 
-    # Extract portfolio holdings: patterns like "AAPL: 100" or "MSFT - 200"
+    # Extract portfolio holdings — try "TICKER: N" format first, then "N TICKER" format
     holdings = {m.group(1): float(m.group(2)) for m in _TICKER_RE.finditer(text)}
+    if len(holdings) < 2:
+        holdings = {m.group(2): float(m.group(1)) for m in _TICKER_RE_REVERSE.finditer(text)}
     if len(holdings) >= 2:          # require at least 2 tickers to avoid false positives
         updates["portfolio_holdings"] = holdings
         log.info("ParamExtractor | portfolio=%s", list(holdings.keys()))
@@ -190,12 +195,108 @@ class _ToolSelection(BaseModel):
     tools: list[str]
 
 
+def _enrich_query(state: FinnieState, query: str) -> str:
+    """Inject remembered portfolio tickers when the user says 'my portfolio' without listing them."""
+    holdings = state.get("portfolio_holdings") or {}
+    if not holdings or _TICKER_RE.search(query):
+        return query
+    if not any(p in query.lower() for p in ["my holding", "my portfolio", "my stock", "my top"]):
+        return query
+    ticker_list = ", ".join(f"{t}: {int(s)}" for t, s in holdings.items())
+    return f"Portfolio: {ticker_list}\n\nQuestion: {query}"
+
+
+def _build_ctx_note(state: FinnieState) -> str:
+    """Summarize established conversation context for the routing prompt."""
+    parts = []
+    if state.get("goal_amount"):
+        parts.append(f"goal ${state['goal_amount']:,.0f}")
+    if state.get("time_horizon_years"):
+        parts.append(f"timeline {state['time_horizon_years']:.0f} yr")
+    if state.get("current_savings") is not None:
+        parts.append(f"savings ${state['current_savings']:,.0f}")
+    if state.get("risk_profile") and state.get("risk_profile") != "moderate":
+        parts.append(f"risk {state['risk_profile']}")
+    if state.get("portfolio_holdings"):
+        parts.append(f"portfolio {list(state['portfolio_holdings'].keys())}")
+    return f"\nConversation context already established: {', '.join(parts)}." if parts else ""
+
+
+def _select_tools(query: str, ctx_note: str) -> list[str]:
+    """Ask the LLM (structured output) to pick the 2 most relevant tools for this query."""
+    tool_list = "\n".join(f"- {name}: {desc}" for name, desc in _TOOL_DESCRIPTIONS.items())
+    routing_prompt = (
+        f"Select the tools needed to give a complete, well-rounded answer to this query.\n\n"
+        f"Available tools:\n{tool_list}\n\n"
+        f"Query: {query}{ctx_note}\n\n"
+        "Rules (apply the FIRST matching rule and stop — do not stack rules):\n"
+        "- News, headlines, or recent events for a specific stock or ticker → get_financial_news + get_market_data\n"
+        "- General advice, tips, or education → answer_finance_question + plan_financial_goal (if goal in context, else + get_tax_education)\n"
+        "- Any 'explain', 'what is', 'how does', 'what are' question (NOT news/prices) → answer_finance_question + get_tax_education\n"
+        "- Context has goal_amount + timeline and message adds savings/contribution/risk → plan_financial_goal + get_tax_education\n"
+        "- Portfolio questions (holdings, sectors, allocation, P/E, rate sensitivity) → analyze_portfolio + get_market_data\n"
+        "- Retirement / savings goal questions → plan_financial_goal + get_tax_education\n"
+        "- 'Is my allocation right for my age?' → analyze_portfolio + answer_finance_question\n"
+        "- Rate hike / interest rate vulnerability → analyze_portfolio + answer_finance_question\n"
+        "- Stock news or market events → get_financial_news + get_market_data\n"
+        "- Tax questions (selling, gains, IRA, 401k) → get_tax_education + answer_finance_question\n"
+        "- 52-week high, dividends, P/E for a specific stock → get_market_data + answer_finance_question\n"
+        "- ALWAYS select exactly 2 tools.\n"
+    )
+    valid_names = {t.name for t in TOOLS}
+    selection = load_llm().with_structured_output(_ToolSelection).invoke([HumanMessage(content=routing_prompt)])
+    selected = [name for name in selection.tools if name in valid_names]
+    return selected or ["answer_finance_question"]
+
+
+_MARKET_INTENT = {"get_market_data", "get_financial_news", "analyze_portfolio"}
+
+
+def _apply_goal_override(state: FinnieState, selected: list[str]) -> list[str]:
+    """Pull in plan_financial_goal for follow-ups when an active goal is in state and no market tool was picked."""
+    if not (state.get("goal_amount") or state.get("time_horizon_years")):
+        return selected
+    if "plan_financial_goal" in selected or any(t in selected for t in _MARKET_INTENT):
+        return selected
+    log.info("SmartFanOut | injected plan_financial_goal for active goal context")
+    return ["plan_financial_goal"] + [s for s in selected if s != "get_financial_news"][:1]
+
+
+def _build_tool_calls(query: str, selected: list[str], holdings: dict) -> list[dict]:
+    """Build tool_calls, expanding get_market_data to per-ticker calls for comparison/portfolio queries."""
+    q = query.lower()
+    is_comparison        = any(t in q for t in ["p/e", "pe ratio", "price-to-earnings", "compare", "versus", "vs"])
+    is_portfolio_analysis = "analyze_portfolio" in selected and bool(holdings)
+
+    if (is_comparison or is_portfolio_analysis) and "get_market_data" in selected and holdings:
+        # Cap at 5 tickers to keep parallel calls manageable; sort by value (shares) descending
+        top_n = sorted(holdings.items(), key=lambda x: x[1], reverse=True)[:5]
+        if is_comparison:
+            per_ticker = [
+                {"name": "get_market_data", "args": {"query": f"P/E ratio and valuation for {t}"},
+                 "id": f"call_md_{t}", "type": "tool_call"}
+                for t, _ in top_n
+            ] + [{"name": "get_market_data", "args": {"query": "S&P 500 SPY average P/E ratio valuation"},
+                  "id": "call_md_SPY", "type": "tool_call"}]
+        else:
+            per_ticker = [
+                {"name": "get_market_data", "args": {"query": f"current price and analysis for {t}"},
+                 "id": f"call_md_{t}", "type": "tool_call"}
+                for t, _ in top_n
+            ]
+        return [
+            {"name": name, "args": {"query": query}, "id": f"call_{name}", "type": "tool_call"}
+            for name in selected if name != "get_market_data"
+        ] + per_ticker
+
+    return [
+        {"name": name, "args": {"query": query}, "id": f"call_{name}", "type": "tool_call"}
+        for name in selected
+    ]
+
+
 def smart_fanout_node(state: FinnieState) -> dict:
-    """
-    Use the LLM to select only the relevant agents for this query,
-    then emit a single AIMessage with those tool_calls so ToolNode
-    runs them in parallel.
-    """
+    """Route to the relevant tools and emit parallel tool_calls for ToolNode to execute."""
     last_human = next(
         (m for m in reversed(state.get("messages", []))
          if hasattr(m, "type") and m.type == "human"),
@@ -204,115 +305,15 @@ def smart_fanout_node(state: FinnieState) -> dict:
     query    = str(last_human.content) if last_human else ""
     holdings = state.get("portfolio_holdings") or {}
 
-    # If the query references "my holdings/portfolio" without listing tickers,
-    # inject the remembered portfolio so tools can work with it.
-    query_lower = query.lower()
-    refs_portfolio = any(p in query_lower for p in ["my holding", "my portfolio", "my stock", "my top"])
-    if refs_portfolio and holdings and not _TICKER_RE.search(query):
-        ticker_list = ", ".join(f"{t}: {int(s)}" for t, s in holdings.items())
-        query = f"Portfolio: {ticker_list}\n\nQuestion: {query}"
-
-    # Build state context so the routing LLM understands ongoing conversations
-    ctx_parts = []
-    if state.get("goal_amount"):
-        ctx_parts.append(f"goal ${state['goal_amount']:,.0f}")
-    if state.get("time_horizon_years"):
-        ctx_parts.append(f"timeline {state['time_horizon_years']:.0f} yr")
-    if state.get("current_savings") is not None:
-        ctx_parts.append(f"savings ${state['current_savings']:,.0f}")
-    if state.get("risk_profile") and state.get("risk_profile") != "moderate":
-        ctx_parts.append(f"risk {state['risk_profile']}")
-    if state.get("portfolio_holdings"):
-        ctx_parts.append(f"portfolio {list(state['portfolio_holdings'].keys())}")
-    ctx_note = (
-        f"\nConversation context already established: {', '.join(ctx_parts)}."
-        if ctx_parts else ""
-    )
-
+    query    = _enrich_query(state, query)
+    ctx_note = _build_ctx_note(state)
     log.info("SmartFanOut | routing query=%r ctx=%s", query[:120], ctx_note[:80])
 
-    tool_list = "\n".join(
-        f"- {name}: {desc}" for name, desc in _TOOL_DESCRIPTIONS.items()
-    )
-    routing_prompt = (
-        f"Select the tools needed to give a complete, well-rounded answer to this query.\n\n"
-        f"Available tools:\n{tool_list}\n\n"
-        f"Query: {query}{ctx_note}\n\n"
-        "Rules (apply the FIRST matching rule and stop — do not stack rules):\n"
-        "- News, headlines, or recent events for a specific stock or ticker → get_financial_news + get_market_data\n"
-        "- General advice, tips, or education ('give me advice', 'tips for investing', 'best practices') → answer_finance_question + plan_financial_goal (only if goal is in context, else answer_finance_question + get_tax_education)\n"
-        "- Any 'explain', 'what is', 'how does', 'what are' question (NOT about news or prices) → answer_finance_question + get_tax_education\n"
-        "- If conversation context shows goal_amount + timeline are already known and this message "
-        "  provides savings, contribution, or risk info → plan_financial_goal + get_tax_education\n"
-        "- Portfolio questions (holdings, sectors, allocation, dividends, P/E, rate sensitivity) → analyze_portfolio + get_market_data\n"
-        "- Retirement / savings goal questions → plan_financial_goal + get_tax_education\n"
-        "- 'Is my allocation right for my age?' → analyze_portfolio + answer_finance_question\n"
-        "- Rate hike / interest rate vulnerability → analyze_portfolio + answer_finance_question\n"
-        "- Stock news or market events → get_financial_news + get_market_data\n"
-        "- Tax questions (selling, gains, IRA, 401k) → get_tax_education + answer_finance_question\n"
-        "- 52-week high, dividends, P/E for a specific stock → get_market_data + answer_finance_question\n"
-        "- ALWAYS select exactly 2 tools. Never more than 2 unless the query explicitly mentions multiple stocks that each need individual price lookups.\n"
-    )
-
-    structured_llm = load_llm().with_structured_output(_ToolSelection)
-    selection = structured_llm.invoke([HumanMessage(content=routing_prompt)])
-
-    valid_names = {t.name for t in TOOLS}
-    selected = [name for name in selection.tools if name in valid_names]
-    if not selected:
-        selected = ["answer_finance_question"]  # safe fallback
-
-    # Hard override: if an active goal is in state, pull in plan_financial_goal for
-    # follow-up messages like "I have savings of $100k" that don't mention the goal explicitly.
-    # Skip when the LLM already picked a market-intent tool — the user is asking about
-    # prices/news/portfolio, not updating their goal.
-    _MARKET_INTENT = {"get_market_data", "get_financial_news", "analyze_portfolio"}
-    if (state.get("goal_amount") or state.get("time_horizon_years")) and \
-            "plan_financial_goal" not in selected and \
-            not any(t in selected for t in _MARKET_INTENT):
-        selected = ["plan_financial_goal"] + [s for s in selected if s != "get_financial_news"][:1]
-        log.info("SmartFanOut | injected plan_financial_goal for active goal context")
-
+    selected = _select_tools(query, ctx_note)
+    selected = _apply_goal_override(state, selected)
     log.info("SmartFanOut | selected=%s | query=%r", selected, query[:60])
 
-    # Replace the single get_market_data call with one call per ticker when:
-    #   a) P/E / comparison query  → top 3 tickers + SPY benchmark
-    #   b) Portfolio analysis query → top 3 tickers (detailed price + analysis)
-    is_comparison     = any(t in query_lower for t in ["p/e", "pe ratio", "price-to-earnings", "compare", "versus", "vs"])
-    is_portfolio_analysis = "analyze_portfolio" in selected and bool(holdings)
-
-    if (is_comparison or is_portfolio_analysis) and "get_market_data" in selected and holdings:
-        top3 = sorted(holdings.items(), key=lambda x: x[1], reverse=True)[:3]
-        if is_comparison:
-            per_ticker_calls = [
-                {"name": "get_market_data",
-                 "args": {"query": f"P/E ratio and valuation for {ticker}"},
-                 "id": f"call_md_{ticker}", "type": "tool_call"}
-                for ticker, _ in top3
-            ]
-            per_ticker_calls.append(
-                {"name": "get_market_data",
-                 "args": {"query": "S&P 500 SPY average P/E ratio valuation"},
-                 "id": "call_md_SPY", "type": "tool_call"}
-            )
-        else:
-            per_ticker_calls = [
-                {"name": "get_market_data",
-                 "args": {"query": f"current price and analysis for {ticker}"},
-                 "id": f"call_md_{ticker}", "type": "tool_call"}
-                for ticker, _ in top3
-            ]
-        tool_calls = [
-            {"name": name, "args": {"query": query}, "id": f"call_{name}", "type": "tool_call"}
-            for name in selected if name != "get_market_data"
-        ] + per_ticker_calls
-    else:
-        tool_calls = [
-            {"name": name, "args": {"query": query}, "id": f"call_{name}", "type": "tool_call"}
-            for name in selected
-        ]
-
-    return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+    return {"messages": [AIMessage(content="", tool_calls=_build_tool_calls(query, selected, holdings))]}
 
 
 def synth_node(state: FinnieState) -> dict:
@@ -325,7 +326,7 @@ def synth_node(state: FinnieState) -> dict:
         start_on="human",
         include_system=False,
     )
-    messages = [SystemMessage(content=_system_prompt(state))] + recent
+    messages = [SystemMessage(content=_synth_prompt(state))] + recent
     log.debug("Synth | sending %d messages", len(messages))
     response = load_llm().invoke(messages)
     log.info("Synth | answer_len=%d", len(str(response.content)))
@@ -362,7 +363,22 @@ def _get_all_graph():
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def invoke(query: str, thread_id: str = "default") -> dict:
+# Default values injected only on the first turn of a thread.
+# Subsequent turns must NOT include these or LangGraph's LastValue channel
+# will overwrite persisted checkpoint values (e.g. reset "aggressive" → "moderate").
+_FIRST_TURN_DEFAULTS = {
+    "risk_profile":        "moderate",
+    "current_savings":     None,
+    "goal_amount":         None,
+    "time_horizon_years":  None,
+    "annual_contribution": None,
+    "portfolio_holdings":  None,
+    "portfolio_value":     None,
+    "age":                 None,
+}
+
+
+def invoke(query: str, thread_id: str = "default", _initial: dict | None = None) -> dict:
     """
     Run one conversational turn through the Finnie ReAct workflow.
 
@@ -379,20 +395,12 @@ def invoke(query: str, thread_id: str = "default") -> dict:
     config = {"configurable": {"thread_id": thread_id}}
     log.info("Invoke | thread=%s | query=%r", thread_id[:8], query[:80])
 
-    # Only pass defaults on the first turn — subsequent invokes must NOT pass
-    # these fields or LangGraph's LastValue channel will overwrite the
-    # persisted checkpoint values (e.g. resetting "aggressive" → "moderate").
-    initial: dict = {"messages": [HumanMessage(content=query)]}
-    if not _get_graph().checkpointer.get(config):
-        initial.update({
-            "risk_profile":       "moderate",
-            "current_savings":    None,
-            "goal_amount":        None,
-            "time_horizon_years": None,
-            "annual_contribution": None,
-            "portfolio_holdings": None,
-            "age":                None,
-        })
+    if _initial is not None:
+        initial = _initial
+    else:
+        initial = {"messages": [HumanMessage(content=query)]}
+        if not _get_graph().checkpointer.get(config):
+            initial.update(_FIRST_TURN_DEFAULTS)
 
     result = _get_graph().invoke(initial, config=config)
 
@@ -407,7 +415,7 @@ def invoke(query: str, thread_id: str = "default") -> dict:
     }
 
 
-def invoke_all(query: str, thread_id: str = "default") -> dict:
+def invoke_all(query: str, thread_id: str = "default", _initial: dict | None = None) -> dict:
     """
     Run one conversational turn through the smart parallel fan-out workflow.
     The LLM first selects only the relevant agents, then runs them in parallel
@@ -426,17 +434,12 @@ def invoke_all(query: str, thread_id: str = "default") -> dict:
     config = {"configurable": {"thread_id": thread_id}}
     log.info("InvokeAll | thread=%s | query=%r", thread_id[:8], query[:80])
 
-    initial: dict = {"messages": [HumanMessage(content=query)]}
-    if not _get_all_graph().checkpointer.get(config):
-        initial.update({
-            "risk_profile":       "moderate",
-            "current_savings":    None,
-            "goal_amount":        None,
-            "time_horizon_years": None,
-            "annual_contribution": None,
-            "portfolio_holdings": None,
-            "age":                None,
-        })
+    if _initial is not None:
+        initial = _initial
+    else:
+        initial = {"messages": [HumanMessage(content=query)]}
+        if not _get_all_graph().checkpointer.get(config):
+            initial.update(_FIRST_TURN_DEFAULTS)
 
     result = _get_all_graph().invoke(initial, config=config)
     last = result["messages"][-1]
@@ -466,14 +469,86 @@ def invoke_all(query: str, thread_id: str = "default") -> dict:
     }
 
 
+# ── Queries that need sequential reasoning (tool B uses tool A's output) ──────
+#
+# For these, the ReAct graph is used so the LLM can chain tool calls.
+# Everything else goes through the faster parallel fan-out graph.
+
+_SEQUENTIAL_QUERIES = (
+    "p/e", "pe ratio", "price-to-earnings",
+    "compare", "versus", "vs ",
+    "rate hike", "rate sensitive", "interest rate", "vulnerable",
+    "52-week", "52 week",
+    "dividend",
+    "at a loss", "trading at a loss", "tax benefit", "tax loss",
+    "allocation", "too aggressive", "too conservative", "for my age",
+    "which of my", "most vulnerable", "most exposed",
+    "falls", "drops", "impact on my portfolio",
+    "shares of", "retire after selling", "selling my shares",
+    "if i sell", "when i sell", "want to sell", "going to sell",
+    "sell all", "sell my", "planning to sell",
+    "how much tax", "tax will i", "tax do i", "tax on selling",
+    # Withdrawal / decumulation — need sequential tool chaining
+    "withdraw", "withdrawal", "drawdown", "draw down",
+    "how long will", "how long would", "how long can",
+    "live off", "live on my", "retirement income",
+    "how much can i take", "how much can i spend",
+    "recalculate", "calculate with",
+    # Retirement + portfolio goal — analyze_portfolio must run first to feed portfolio_value
+    # into plan_financial_goal; parallel fanout cannot do this ordering
+    "retire with", "retire in", "want to retire",
+    "save for retirement", "retirement goal",
+)
+
+
+def chat(query: str, thread_id: str = "default") -> dict:
+    """
+    Single entry point for a conversational turn.
+
+    Routes to the ReAct graph when the query requires sequential tool use
+    (e.g. one tool's output feeds the next), or to the parallel fan-out
+    graph for everything else — never both.
+
+    Returns:
+        {
+            "answer":      str,   final answer, $ signs escaped for Streamlit
+            "messages":    list,  full message history
+            "agents_used": list,  tool names called this turn
+        }
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    initial: dict = {"messages": [HumanMessage(content=query)]}
+    if not _MEMORY.get(config):
+        initial.update(_FIRST_TURN_DEFAULTS)
+
+    if any(k in query.lower() for k in _SEQUENTIAL_QUERIES):
+        result = invoke(query, thread_id=thread_id, _initial=initial)
+        msgs = result["messages"]
+        last_human_idx = next(
+            (i for i in range(len(msgs) - 1, -1, -1)
+             if hasattr(msgs[i], "type") and msgs[i].type == "human"),
+            0,
+        )
+        agents_used = [
+            m.name for m in msgs[last_human_idx:]
+            if isinstance(m, ToolMessage) and hasattr(m, "name")
+        ]
+        answer = re.sub(r"(?<!\\)\$", r"\\$", result["answer"])
+        return {**result, "answer": answer, "agents_used": agents_used}
+
+    return invoke_all(query, thread_id=thread_id, _initial=initial)
+
+
 # ── Smoke test ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     tid = "demo"
 
     turns = [
-       """I have 10 AAPL, 5 MSFT, 3 GOOGL, 2 TSLA, and 8 NVDA stocks.
+       """I have 1000 AAPL, 500 MSFT, 300 GOOGL, 200 TSLA, and 800 NVDA stocks.
 I want to retire in 20 years with $2 million and I currently have $100K saved.
+Add the value of my portfolio to my savings and tell me if I'm on track to reach my goal. 
+Also, what's the news on these stocks?,
 I'm aggressive with risk.
 can I actually reach my $2M goal, and can you explain how compound interest works?
 """

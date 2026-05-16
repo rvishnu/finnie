@@ -14,4 +14,5 @@ class FinnieState(TypedDict):
     current_savings:      float | None   # None = not yet provided by user
     annual_contribution:  float | None   # yearly contribution ($2k/mo → 24000/yr)
     portfolio_holdings:   dict | None    # {"AAPL": 100, "MSFT": 200, ...}
+    portfolio_value:      float | None   # total value from latest analyze_portfolio call
     age:                  int | None     # user's current age

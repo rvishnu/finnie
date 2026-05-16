@@ -129,6 +129,10 @@ ARTICLES = [
     ("Required Minimum Distributions", "https://www.investopedia.com/terms/r/requiredminimumdistribution.asp"),
     ("Annuities", "https://www.investopedia.com/terms/a/annuity.asp"),
     ("When to Retire", "https://www.investopedia.com/articles/retirement/when-can-you-retire.asp"),
+    ("4% Rule",                        "https://www.investopedia.com/terms/f/four-percent-rule.asp"),
+    ("Safe Withdrawal Rate",           "https://www.investopedia.com/ask/answers/05/retirementmoneylast.asp"),
+    ("Sequence of Returns Risk",       "https://www.investopedia.com/terms/s/sequence-risk.asp"),
+    ("Retirement Withdrawal Strategies", "https://www.investopedia.com/retirement/retirement-income-planning/"),
 
     ("Life Insurance", "https://www.investopedia.com/terms/l/lifeinsurance.asp"),
     ("Health Insurance Basics", "https://www.investopedia.com/terms/h/healthinsurance.asp"),

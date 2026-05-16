@@ -23,6 +23,7 @@ Usage:
 """
 
 import re
+import math
 
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
@@ -83,6 +84,23 @@ class _GoalParams(BaseModel):
         "Do NOT include goal_amount, current_savings, or target amounts as contributions. "
         "If given as monthly, multiply by 12. "
         "Return null if no ongoing contribution amount is mentioned."
+    ))
+    withdrawal_mode: bool = Field(False, description=(
+        "True when the user asks how much they can WITHDRAW from existing savings, "
+        "how long their nest egg will last, or asks about retirement income drawdown. "
+        "Key signals: 'withdraw', 'how long will it last', 'drawdown', 'take out each month', "
+        "'live off my savings', 'retirement income', 'how much can I spend'. "
+        "False for accumulation questions (saving toward a goal amount)."
+    ))
+    withdrawal_amount: float | None = Field(None, description=(
+        "Monthly withdrawal amount in dollars if the user specifies how much they want to withdraw. "
+        "Example: 'withdraw $10,000/month' → 10000. Return null if not mentioned."
+    ))
+    nest_egg: float | None = Field(None, description=(
+        "The starting savings balance for withdrawal/decumulation planning. "
+        "Use when the user says 'I have $X' or 'starting with $X' in a withdrawal context. "
+        "This is money they already HAVE, not a goal to save toward. "
+        "Return null if not in withdrawal mode."
     ))
 
 
@@ -160,14 +178,45 @@ Plan:
 """)
 
 
+WITHDRAWAL_PROMPT = ChatPromptTemplate.from_template("""
+You are Finnie, a friendly financial education assistant.
+The user wants to know how much they can withdraw from their retirement nest egg, or how long it will last.
+
+Withdrawal Metrics:
+{metrics}
+
+Financial Knowledge (from knowledge base):
+{context}
+
+User's risk tolerance: {risk_profile}
+Assumed annual return: {annual_return_pct}%
+
+IMPORTANT — use ONLY the numbers from "Withdrawal Metrics" above. Do NOT recompute or estimate.
+Use "USD X,XXX" format for all currency amounts. Never use "$X,XXX".
+
+Provide a clear answer covering:
+1. Direct answer: how much they can withdraw per month (or how long the money lasts)
+2. The 4% rule as a benchmark — quote the safe monthly amount from the metrics as a reference
+3. How the assumed {annual_return_pct}% annual return affects sustainability
+4. Sequence-of-returns risk: why a bad early year can cut the timeline shorter than expected
+5. Tax note: withdrawals from traditional 401k/IRA are ordinary taxable income; Roth withdrawals are tax-free
+6. One practical tip (e.g. flexible spending, keeping 1-2 years in cash, delaying Social Security)
+
+Always end with: "This is for educational purposes only and is not financial advice."
+
+Answer:
+""")
+
+
 class GoalPlanningAgent:
 
     def __init__(self):
-        self.retriever        = get_retriever()
-        self.llm              = load_llm()
-        self.chain            = PROMPT | self.llm | StrOutputParser()
-        self.projection_chain = PROJECTION_PROMPT | self.llm | StrOutputParser()
-        self.goal_parser      = self.llm.with_structured_output(_GoalParams)
+        self.retriever         = get_retriever()
+        self.llm               = load_llm()
+        self.chain             = PROMPT | self.llm | StrOutputParser()
+        self.projection_chain  = PROJECTION_PROMPT | self.llm | StrOutputParser()
+        self.withdrawal_chain  = WITHDRAWAL_PROMPT | self.llm | StrOutputParser()
+        self.goal_parser       = self.llm.with_structured_output(_GoalParams)
 
     def _parse_goal_from_text(self, text: str) -> dict:
         parsed = self.goal_parser.invoke(f"Extract financial goal details from this text: {text}")
@@ -184,11 +233,14 @@ class GoalPlanningAgent:
                 horizon = age_based
 
         return {
-            "goal_amount":        parsed.goal_amount,
-            "time_horizon_years": horizon,
-            "current_savings":    parsed.current_savings,
-            "risk_profile":       parsed.risk_profile,
+            "goal_amount":         parsed.goal_amount,
+            "time_horizon_years":  horizon,
+            "current_savings":     parsed.current_savings,
+            "risk_profile":        parsed.risk_profile,
             "annual_contribution": parsed.annual_contribution,
+            "withdrawal_mode":     parsed.withdrawal_mode,
+            "withdrawal_amount":   parsed.withdrawal_amount,
+            "nest_egg":            parsed.nest_egg,
         }
 
     @staticmethod
@@ -296,12 +348,166 @@ class GoalPlanningAgent:
         ])
 
     @staticmethod
+    def _calculate_withdrawal_metrics(
+        nest_egg: float,
+        annual_return: float,
+        time_horizon_years: float | None = None,
+        monthly_withdrawal: float | None = None,
+    ) -> dict:
+        monthly_rate = annual_return / 12
+        safe_monthly = round(nest_egg * 0.04 / 12, 2)
+
+        if time_horizon_years and not monthly_withdrawal:
+            # Given nest egg + duration → compute sustainable monthly withdrawal
+            months = time_horizon_years * 12
+            if monthly_rate > 0:
+                w = nest_egg * monthly_rate / (1 - (1 + monthly_rate) ** -months)
+            else:
+                w = nest_egg / months
+            return {
+                "nest_egg":            round(nest_egg, 2),
+                "time_horizon_years":  round(time_horizon_years, 2),
+                "monthly_withdrawal":  round(w, 2),
+                "annual_withdrawal":   round(w * 12, 2),
+                "annual_return_pct":   round(annual_return * 100, 1),
+                "rule_of_4pct_monthly": safe_monthly,
+                "mode":                "withdrawal_by_duration",
+            }
+
+        if monthly_withdrawal and not time_horizon_years:
+            # Given nest egg + desired withdrawal → compute how long it lasts
+            if monthly_rate > 0 and monthly_withdrawal > nest_egg * monthly_rate:
+                months = -math.log(1 - nest_egg * monthly_rate / monthly_withdrawal) / math.log(1 + monthly_rate)
+                years = round(months / 12, 1)
+                lasts_forever = False
+            elif monthly_rate > 0 and monthly_withdrawal <= nest_egg * monthly_rate:
+                years = None
+                lasts_forever = True
+            else:
+                years = round(nest_egg / monthly_withdrawal / 12, 1)
+                lasts_forever = False
+            return {
+                "nest_egg":            round(nest_egg, 2),
+                "monthly_withdrawal":  round(monthly_withdrawal, 2),
+                "annual_withdrawal":   round(monthly_withdrawal * 12, 2),
+                "duration_years":      years,
+                "lasts_forever":       lasts_forever,
+                "annual_return_pct":   round(annual_return * 100, 1),
+                "rule_of_4pct_monthly": safe_monthly,
+                "mode":                "withdrawal_duration",
+            }
+
+        if time_horizon_years and monthly_withdrawal:
+            # Both given — check if the requested withdrawal is sustainable
+            months = time_horizon_years * 12
+            if monthly_rate > 0:
+                max_w = nest_egg * monthly_rate / (1 - (1 + monthly_rate) ** -months)
+            else:
+                max_w = nest_egg / months
+            return {
+                "nest_egg":                  round(nest_egg, 2),
+                "time_horizon_years":        round(time_horizon_years, 2),
+                "monthly_withdrawal":        round(monthly_withdrawal, 2),
+                "max_sustainable_monthly":   round(max_w, 2),
+                "sustainable_for_horizon":   monthly_withdrawal <= max_w,
+                "annual_return_pct":         round(annual_return * 100, 1),
+                "rule_of_4pct_monthly":      safe_monthly,
+                "mode":                      "withdrawal_check",
+            }
+
+        # Default overview: 4% rule + multiple durations
+        overview: dict = {
+            "nest_egg":              round(nest_egg, 2),
+            "annual_return_pct":     round(annual_return * 100, 1),
+            "rule_of_4pct_monthly":  safe_monthly,
+            "rule_of_4pct_annual":   round(nest_egg * 0.04, 2),
+        }
+        for years in [20, 25, 30, 35]:
+            months = years * 12
+            if monthly_rate > 0:
+                w = nest_egg * monthly_rate / (1 - (1 + monthly_rate) ** -months)
+            else:
+                w = nest_egg / months
+            overview[f"monthly_{years}yr"] = round(w, 2)
+        overview["mode"] = "withdrawal_overview"
+        return overview
+
+    @staticmethod
+    def _format_withdrawal_metrics_for_llm(metrics: dict) -> str:
+        mode = metrics.get("mode", "withdrawal_overview")
+        lines = [f"Nest Egg:              USD {metrics['nest_egg']:,.2f}",
+                 f"Assumed Annual Return: {metrics['annual_return_pct']}%",
+                 f"4% Rule (safe rate):   USD {metrics['rule_of_4pct_monthly']:,.2f}/month"]
+        if mode == "withdrawal_by_duration":
+            lines += [
+                f"Time Horizon:          {metrics['time_horizon_years']} years",
+                f"Monthly Withdrawal:    USD {metrics['monthly_withdrawal']:,.2f}",
+                f"Annual Withdrawal:     USD {metrics['annual_withdrawal']:,.2f}",
+            ]
+        elif mode == "withdrawal_duration":
+            dur = "indefinitely (growth exceeds withdrawals)" if metrics.get("lasts_forever") else f"{metrics['duration_years']} years"
+            lines += [
+                f"Requested Monthly:     USD {metrics['monthly_withdrawal']:,.2f}",
+                f"Annual Withdrawal:     USD {metrics['annual_withdrawal']:,.2f}",
+                f"Duration:             {dur}",
+            ]
+        elif mode == "withdrawal_check":
+            verdict = "YES — sustainable" if metrics["sustainable_for_horizon"] else "NO — too high"
+            lines += [
+                f"Time Horizon:          {metrics['time_horizon_years']} years",
+                f"Requested Monthly:     USD {metrics['monthly_withdrawal']:,.2f}",
+                f"Max Sustainable:       USD {metrics['max_sustainable_monthly']:,.2f}/month",
+                f"Sustainable?           {verdict}",
+            ]
+        else:  # overview
+            lines += [
+                f"4% Rule Annual:        USD {metrics['rule_of_4pct_annual']:,.2f}",
+                f"If withdrawn over 20 years: USD {metrics.get('monthly_20yr', 0):,.2f}/month",
+                f"If withdrawn over 25 years: USD {metrics.get('monthly_25yr', 0):,.2f}/month",
+                f"If withdrawn over 30 years: USD {metrics.get('monthly_30yr', 0):,.2f}/month",
+                f"If withdrawn over 35 years: USD {metrics.get('monthly_35yr', 0):,.2f}/month",
+            ]
+        return "\n".join(lines)
+
+    @staticmethod
     def _escape_markdown_currency(text: str) -> str:
         return re.sub(r"(?<!\\)\$", r"\\$", text)
 
     def _get_rag_context(self, query: str) -> str:
         docs = self.retriever.invoke(query)
         return "\n\n".join(doc.page_content for doc in docs)
+
+    def run_withdrawal(
+        self,
+        nest_egg: float,
+        risk_profile: str = "moderate",
+        time_horizon_years: float | None = None,
+        monthly_withdrawal: float | None = None,
+        query: str = "",
+    ) -> dict:
+        """
+        Decumulation / withdrawal planning.
+
+        Returns:
+            {"answer": str, "metrics": dict, "error": None}
+        """
+        annual_return = RETURN_RATES.get(risk_profile, RETURN_RATES["moderate"])
+        log.info("GoalPlanningAgent.run_withdrawal | nest_egg=$%.0f | horizon=%s | monthly_wd=%s",
+                 nest_egg, time_horizon_years or "?", f"${monthly_withdrawal:,.0f}" if monthly_withdrawal else "?")
+
+        metrics     = self._calculate_withdrawal_metrics(nest_egg, annual_return, time_horizon_years, monthly_withdrawal)
+        metrics_str = self._format_withdrawal_metrics_for_llm(metrics)
+        context     = self._get_rag_context(query or f"retirement withdrawal nest egg {nest_egg}")
+
+        answer = self.withdrawal_chain.invoke({
+            "metrics":           metrics_str,
+            "context":           context,
+            "risk_profile":      risk_profile,
+            "annual_return_pct": metrics["annual_return_pct"],
+        })
+        answer = self._escape_markdown_currency(answer)
+        log.info("GoalPlanningAgent.run_withdrawal | done | mode=%s", metrics.get("mode"))
+        return {"answer": answer, "metrics": metrics, "error": None}
 
     def run(
         self,

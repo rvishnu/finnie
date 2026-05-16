@@ -75,7 +75,8 @@ def answer_finance_question(
 def analyze_portfolio(
     query: str,
     state: Annotated[dict, InjectedState],
-) -> str:
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command:
     """
     Analyze a user's stock portfolio.
     Use if for Goal Analysis if user mentions their portfolio to find the total value,
@@ -95,6 +96,7 @@ def analyze_portfolio(
 
     failed = result.get("failed", [])
     if metrics:
+        total_value = metrics.get("total_value", 0)
         holdings_lines = "".join(
             f"  {h['ticker']}: {h['shares']} shares @ USD {h['price']:,.2f}"
             f" = USD {h['position_value']:,.2f} ({h['allocation_pct']:.1f}%)"
@@ -105,7 +107,7 @@ def analyze_portfolio(
             for h in metrics.get("holdings", [])
         )
         summary = (
-            f"Portfolio Total Value: USD {metrics.get('total_value', 0):,.2f}\n"
+            f"Portfolio Total Value: USD {total_value:,.2f}\n"
             f"Positions: {metrics.get('num_positions', 0)}\n"
             f"Diversification Score: {metrics.get('diversification_score', 0)}/10\n"
             f"Individual Positions (live prices):\n{holdings_lines}"
@@ -117,11 +119,21 @@ def analyze_portfolio(
                 f"These ticker symbols may be invalid or misspelled — "
                 f"please tell the user to double-check them.\n\n"
             )
+        # Persist the resolved tickers back to state so follow-up turns ("what's the news on my stocks?")
+        # use the correct ticker symbols, even when the user typed company names like "Google" or "NVIDIA".
+        resolved_holdings = {h["ticker"]: h["shares"] for h in metrics.get("holdings", [])}
         log.info("Tool | analyze_portfolio | done | value=%.2f positions=%d failed=%s",
-                 metrics.get("total_value", 0), metrics.get("num_positions", 0), failed or "none")
-        return summary + answer
+                 total_value, metrics.get("num_positions", 0), failed or "none")
+        return Command(update={
+            "messages":         [ToolMessage(content=summary + answer, tool_call_id=tool_call_id)],
+            "portfolio_value":  total_value,
+            "portfolio_holdings": resolved_holdings or state.get("portfolio_holdings"),
+        })
+
     log.info("Tool | analyze_portfolio | done | no metrics | answer_len=%d", len(answer))
-    return answer
+    return Command(update={
+        "messages": [ToolMessage(content=answer, tool_call_id=tool_call_id)],
+    })
 
 
 @tool
@@ -183,9 +195,14 @@ def plan_financial_goal(
     """
     Plan a savings or retirement goal — calculate monthly contributions needed,
     projected value, and investment growth impact.
+    ALSO handles withdrawal / decumulation: how much to withdraw from a nest egg,
+    how long savings will last, or sustainable monthly income from a portfolio.
     Use when the user mentions saving for retirement, a house, education,
     or any financial target with an amount and timeline.
-    Examples: "I want $2M in 20 years", "How much to save for a house in 5 years".
+    ALSO use when the user asks: "how much can I withdraw", "how long will my money last",
+    "retirement income", or mentions a large nest egg and asks about monthly spending.
+    Examples: "I want $2M in 20 years", "How much to save for a house in 5 years",
+    "With $3M how much can I withdraw monthly?", "Will $2M last 30 years at $8k/month?".
     Also use other tools to find the value of the user's current portfolio.
     """
     log.info("Tool | plan_financial_goal | query=%r", query[:60])
@@ -193,6 +210,7 @@ def plan_financial_goal(
     goal_amount         = state.get("goal_amount")
     time_horizon_years  = state.get("time_horizon_years")
     current_savings     = state.get("current_savings")
+    portfolio_value     = state.get("portfolio_value") or 0.0
     annual_contribution = state.get("annual_contribution")
     risk_profile        = state.get("risk_profile", "moderate")
 
@@ -200,18 +218,75 @@ def plan_financial_goal(
     # Only overwrite existing state values for risk/contribution (user may update them);
     # never overwrite an established goal/timeline.
     agent = _load()["goal"]
+    withdrawal_mode   = False
+    withdrawal_amount = None
     if query:
         parsed = agent._parse_goal_from_text(query)
-        if not goal_amount:
-            goal_amount = parsed.get("goal_amount")
-        if not time_horizon_years:
-            time_horizon_years = parsed.get("time_horizon_years")
-        if current_savings is None and parsed.get("current_savings") is not None:
-            current_savings = parsed["current_savings"]
-        if parsed.get("risk_profile"):
-            risk_profile = parsed["risk_profile"]
-        if annual_contribution is None:
-            annual_contribution = parsed.get("annual_contribution")
+        withdrawal_mode   = parsed.get("withdrawal_mode", False)
+        withdrawal_amount = parsed.get("withdrawal_amount")
+
+        if withdrawal_mode:
+            # In decumulation mode, the user's "$X" is the nest egg, not a savings goal.
+            nest_egg_parsed = parsed.get("nest_egg") or parsed.get("current_savings")
+            if current_savings is None and nest_egg_parsed:
+                current_savings = nest_egg_parsed
+            if not time_horizon_years:
+                time_horizon_years = parsed.get("time_horizon_years")
+            if parsed.get("risk_profile"):
+                risk_profile = parsed["risk_profile"]
+        else:
+            if not goal_amount:
+                goal_amount = parsed.get("goal_amount")
+            if not time_horizon_years:
+                time_horizon_years = parsed.get("time_horizon_years")
+            if current_savings is None and parsed.get("current_savings") is not None:
+                current_savings = parsed["current_savings"]
+            if parsed.get("risk_profile"):
+                risk_profile = parsed["risk_profile"]
+            if annual_contribution is None:
+                annual_contribution = parsed.get("annual_contribution")
+
+    # ── Withdrawal / decumulation path ────────────────────────────────────────
+    if withdrawal_mode:
+        nest_egg = (current_savings or 0.0) + portfolio_value
+        log.info("Tool | plan_financial_goal | withdrawal mode | nest_egg=%.2f horizon=%s monthly_wd=%s",
+                 nest_egg, time_horizon_years, withdrawal_amount)
+
+        def _wd_respond(content: str) -> Command:
+            updates: dict = {"messages": [ToolMessage(content=content, tool_call_id=tool_call_id)]}
+            if current_savings is not None:
+                updates["current_savings"] = current_savings
+            if time_horizon_years:
+                updates["time_horizon_years"] = time_horizon_years
+            if risk_profile:
+                updates["risk_profile"] = risk_profile
+            return Command(update=updates)
+
+        if nest_egg <= 0:
+            return _wd_respond(
+                "To calculate your withdrawal plan I need to know your current savings or portfolio value. "
+                "How much do you have saved or invested?"
+            )
+
+        result  = agent.run_withdrawal(
+            nest_egg=nest_egg,
+            risk_profile=risk_profile,
+            time_horizon_years=time_horizon_years,
+            monthly_withdrawal=withdrawal_amount,
+            query=query,
+        )
+        metrics = result.get("metrics", {})
+        answer  = result.get("answer", "")
+
+        summary_lines = [f"Nest egg: USD {nest_egg:,.0f}"]
+        if metrics.get("monthly_withdrawal"):
+            summary_lines.append(f"Monthly withdrawal: USD {metrics['monthly_withdrawal']:,.2f}")
+        if metrics.get("duration_years"):
+            summary_lines.append(f"Duration: {metrics['duration_years']} years")
+        if metrics.get("rule_of_4pct_monthly"):
+            summary_lines.append(f"4% Rule benchmark: USD {metrics['rule_of_4pct_monthly']:,.2f}/month")
+        log.info("Tool | plan_financial_goal | withdrawal done | mode=%s", metrics.get("mode"))
+        return _wd_respond("\n".join(summary_lines) + "\n\n" + answer)
 
     # Infer current_savings from a portfolio result injected into the query context.
     if current_savings is None and "Portfolio Value:" in query:
@@ -240,7 +315,9 @@ def plan_financial_goal(
         log.info("Tool | plan_financial_goal | missing=%s", missing)
         return _respond("To build your savings plan I need: " + " and ".join(missing) + ". Could you share those?")
 
-    if current_savings is None:
+    # Combine cash savings with portfolio value so goal planning uses the real starting balance.
+    # current_savings stays as-is in state (cash only); effective_savings is the working total.
+    if current_savings is None and portfolio_value == 0.0:
         log.info("Tool | plan_financial_goal | awaiting current_savings")
         contrib_note = f", investing USD {annual_contribution/12:,.0f}/month" if annual_contribution else ""
         return _respond(
@@ -250,11 +327,16 @@ def plan_financial_goal(
             "(Just reply with the amount, or say '0' if you're starting from scratch.)"
         )
 
+    effective_savings = portfolio_value + (current_savings or 0.0)
+    if portfolio_value > 0 and current_savings:
+        log.info("Tool | plan_financial_goal | effective_savings=%.2f (portfolio=%.2f + cash=%.2f)",
+                 effective_savings, portfolio_value, current_savings)
+
     result = agent.run(
         query=query,
         goal_amount=goal_amount,
         time_horizon_years=time_horizon_years,
-        current_savings=current_savings,
+        current_savings=effective_savings,
         risk_profile=risk_profile,
         annual_contribution=annual_contribution,
     )
@@ -339,15 +421,32 @@ def get_tax_education(
     if metrics:
         scenario = result.get("scenario", "")
         if scenario == "capital_gains":
-            summary = (
-                f"Gain: ${metrics.get('gain', 0):,.2f} | "
-                f"Type: {metrics.get('holding_type', '')} | "
-                f"Tax rate: {metrics.get('tax_rate_pct', 0)}% | "
-                f"Estimated tax: ${metrics.get('estimated_tax', 0):,.2f} | "
-                f"Net gain: ${metrics.get('net_gain', 0):,.2f}\n\n"
-            )
-            log.info("Tool | get_tax_education | done | scenario=capital_gains tax=%.2f",
-                     metrics.get("estimated_tax", 0))
+            per_stock = metrics.get("per_stock", [])
+            if per_stock:
+                stock_lines = "\n".join(
+                    f"  {s['ticker']}: {s['shares']:.0f} shares × "
+                    f"(USD {s['current_price']:,.2f} − USD {s['purchase_price']:,.2f}) "
+                    f"= USD {s['gain']:,.2f}"
+                    for s in per_stock
+                )
+                summary = (
+                    f"Per-stock gains (Python-computed):\n{stock_lines}\n"
+                    f"Total Gain: USD {metrics.get('gain', 0):,.2f} | "
+                    f"Type: {metrics.get('holding_type', '')} | "
+                    f"Tax rate: {metrics.get('tax_rate_pct', 0)}% | "
+                    f"Estimated tax: USD {metrics.get('estimated_tax', 0):,.2f} | "
+                    f"Net gain: USD {metrics.get('net_gain', 0):,.2f}\n\n"
+                )
+            else:
+                summary = (
+                    f"Gain: USD {metrics.get('gain', 0):,.2f} | "
+                    f"Type: {metrics.get('holding_type', '')} | "
+                    f"Tax rate: {metrics.get('tax_rate_pct', 0)}% | "
+                    f"Estimated tax: USD {metrics.get('estimated_tax', 0):,.2f} | "
+                    f"Net gain: USD {metrics.get('net_gain', 0):,.2f}\n\n"
+                )
+            log.info("Tool | get_tax_education | done | scenario=capital_gains tax=%.2f positions=%d",
+                     metrics.get("estimated_tax", 0), len(per_stock))
             return summary + answer
         if scenario == "tax_loss_harvesting":
             summary = (
