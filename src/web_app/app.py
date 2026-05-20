@@ -27,7 +27,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-from src.workflow.graph import invoke as chat_invoke
+from src.workflow.graph import chat as chat_invoke
 from src.agents.portfolio_agent import PortfolioAnalysisAgent
 from src.agents.market_agent import MarketAnalysisAgent
 from src.utils.market_tools import _fetch_alpha_vantage, _fetch_yfinance

@@ -262,6 +262,18 @@ def _apply_goal_override(state: FinnieState, selected: list[str]) -> list[str]:
     return ["plan_financial_goal"] + [s for s in selected if s != "get_financial_news"][:1]
 
 
+def _apply_portfolio_override(selected: list[str], holdings: dict) -> list[str]:
+    """Ensure get_market_data is always paired with analyze_portfolio.
+
+    The routing LLM sometimes picks answer_finance_question as the companion,
+    which skips live price data. Force the correct pairing whenever holdings exist.
+    """
+    if "analyze_portfolio" in selected and "get_market_data" not in selected and holdings:
+        log.info("SmartFanOut | injected get_market_data alongside analyze_portfolio")
+        return ["analyze_portfolio", "get_market_data"]
+    return selected
+
+
 def _build_tool_calls(query: str, selected: list[str], holdings: dict) -> list[dict]:
     """Build tool_calls, expanding get_market_data to per-ticker calls for comparison/portfolio queries."""
     q = query.lower()
@@ -311,6 +323,7 @@ def smart_fanout_node(state: FinnieState) -> dict:
 
     selected = _select_tools(query, ctx_note)
     selected = _apply_goal_override(state, selected)
+    selected = _apply_portfolio_override(selected, holdings)
     log.info("SmartFanOut | selected=%s | query=%r", selected, query[:60])
 
     return {"messages": [AIMessage(content="", tool_calls=_build_tool_calls(query, selected, holdings))]}

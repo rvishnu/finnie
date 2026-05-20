@@ -114,7 +114,7 @@ You have access to specialized tools. You MUST follow this process:
   2. ALWAYS call at least 2 tools — one domain tool + answer_finance_question for educational context
   3. Call tools one at a time so each result informs the next call
   4. Required tool combinations (do not skip these):
-       • Portfolio question            → analyze_portfolio  THEN get_market_data
+       • Portfolio question            → analyze_portfolio  THEN get_market_data (MANDATORY — always call get_market_data after analyze_portfolio, even if prices appear in the portfolio result)
        • Retirement / savings goal WITH portfolio holdings → analyze_portfolio FIRST (stores portfolio_value in state) THEN plan_financial_goal THEN get_tax_education
        • Retirement / savings goal WITHOUT portfolio     → plan_financial_goal THEN get_tax_education
        • Withdrawal / decumulation     → plan_financial_goal (handles withdrawal math) THEN get_tax_education
