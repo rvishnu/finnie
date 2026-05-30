@@ -224,7 +224,7 @@ def _build_ctx_note(state: FinnieState) -> str:
 
 
 def _select_tools(query: str, ctx_note: str) -> list[str]:
-    """Ask the LLM (structured output) to pick the 2 most relevant tools for this query."""
+    """Ask the LLM (structured output) to pick 2-3 relevant tools for this query."""
     tool_list = "\n".join(f"- {name}: {desc}" for name, desc in _TOOL_DESCRIPTIONS.items())
     routing_prompt = (
         f"Select the tools needed to give a complete, well-rounded answer to this query.\n\n"
@@ -241,13 +241,16 @@ def _select_tools(query: str, ctx_note: str) -> list[str]:
         "- Rate hike / interest rate vulnerability → analyze_portfolio + answer_finance_question\n"
         "- Stock news or market events → get_financial_news + get_market_data\n"
         "- Tax questions (selling, gains, IRA, 401k) → get_tax_education + answer_finance_question\n"
+        "- Portfolio + tax (selling stocks, capital gains on holdings) → analyze_portfolio + get_tax_education + answer_finance_question\n"
+        "- Portfolio + retirement goal → analyze_portfolio + plan_financial_goal + get_tax_education\n"
         "- 52-week high, dividends, P/E for a specific stock → get_market_data + answer_finance_question\n"
-        "- ALWAYS select exactly 2 tools.\n"
+        "Select 2 tools for simple single-domain queries. Select 3 tools when the query clearly spans "
+        "multiple domains (e.g. portfolio + tax, portfolio + goal, news + education). Never select more than 3.\n"
     )
     valid_names = {t.name for t in TOOLS}
     selection = load_llm().with_structured_output(_ToolSelection).invoke([HumanMessage(content=routing_prompt)])
     selected = [name for name in selection.tools if name in valid_names]
-    return selected or ["answer_finance_question"]
+    return selected[:3] or ["answer_finance_question"]
 
 
 _MARKET_INTENT = {"get_market_data", "get_financial_news", "analyze_portfolio"}
