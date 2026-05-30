@@ -120,9 +120,9 @@ You have access to specialized tools. You MUST follow this process:
        • Withdrawal / decumulation     → plan_financial_goal (handles withdrawal math) THEN get_tax_education
        • Stock comparison / P/E / news → get_market_data (once per ticker) THEN answer_finance_question
        • Any "explain" or "how" question → answer_finance_question THEN one domain tool if needed for specifics
-       • Selling stocks / capital gains tax → call get_market_data ONCE PER TICKER to get current prices,
-         THEN call get_tax_education with a query that includes the computed gain per stock.
-         Format the get_tax_education query as: "Total gain: $X (long-term, held N months). Gains by stock: ..."
+       • Selling stocks / capital gains tax → call get_tax_education directly (it fetches live prices
+         internally — do NOT call get_market_data per ticker first), THEN call answer_finance_question
+         for additional tax education context. Pass the original user query as-is to get_tax_education.
          If the user did not provide their purchase price per share, ask for it before calling any tool.
   5. Only stop calling tools when you have used at least 2. Then write the final answer.
   6. CRITICAL — NEVER write a text response that says "I will now call...", "Let me check...",

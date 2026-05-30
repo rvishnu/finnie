@@ -36,6 +36,7 @@ from pydantic import BaseModel
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.errors import GraphRecursionError
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage, trim_messages
 
 from src.core.llm import load_llm
@@ -405,7 +406,7 @@ def invoke(query: str, thread_id: str = "default", _initial: dict | None = None)
             "messages":  list,  full updated message history
         }
     """
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 15}
     log.info("Invoke | thread=%s | query=%r", thread_id[:8], query[:80])
 
     if _initial is not None:
@@ -415,7 +416,18 @@ def invoke(query: str, thread_id: str = "default", _initial: dict | None = None)
         if not _get_graph().checkpointer.get(config):
             initial.update(_FIRST_TURN_DEFAULTS)
 
-    result = _get_graph().invoke(initial, config=config)
+    try:
+        result = _get_graph().invoke(initial, config=config)
+    except GraphRecursionError:
+        log.warning("Invoke | thread=%s | recursion limit hit — returning graceful error", thread_id[:8])
+        return {
+            "answer": (
+                "I hit a complexity limit while researching your question. "
+                "Please try rephrasing or breaking it into smaller parts — for example, "
+                "ask about each stock separately."
+            ),
+            "messages": initial.get("messages", []),
+        }
 
     # Last message is always the LLM's final answer
     last = result["messages"][-1]
@@ -444,7 +456,7 @@ def invoke_all(query: str, thread_id: str = "default", _initial: dict | None = N
             "messages":  list,  full updated message history
         }
     """
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 10}
     log.info("InvokeAll | thread=%s | query=%r", thread_id[:8], query[:80])
 
     if _initial is not None:
@@ -454,7 +466,18 @@ def invoke_all(query: str, thread_id: str = "default", _initial: dict | None = N
         if not _get_all_graph().checkpointer.get(config):
             initial.update(_FIRST_TURN_DEFAULTS)
 
-    result = _get_all_graph().invoke(initial, config=config)
+    try:
+        result = _get_all_graph().invoke(initial, config=config)
+    except GraphRecursionError:
+        log.warning("InvokeAll | thread=%s | recursion limit hit", thread_id[:8])
+        return {
+            "answer": (
+                "I hit a complexity limit while researching your question. "
+                "Please try rephrasing or breaking it into smaller parts."
+            ),
+            "messages":    initial.get("messages", []),
+            "agents_used": [],
+        }
     last = result["messages"][-1]
 
     # Collect tools called in THIS turn only (after the last HumanMessage)

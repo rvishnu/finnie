@@ -295,7 +295,8 @@ class TaxEducationAgent:
         holding_months = parsed.holding_months
         q_lower = query.lower()
         _LONG_TERM_PHRASES = ("long term", "long-term", "more than a year", "over a year",
-                              "several years", "many years", "years ago")
+                              "several years", "many years", "years ago",
+                              "long time", "a long time", "for years")
         if any(p in q_lower for p in _LONG_TERM_PHRASES):
             holding_months = 999
             log.info("TaxEducationAgent | holding_months=999 (long-term phrase detected)")
