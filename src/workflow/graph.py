@@ -187,7 +187,7 @@ _TOOL_DESCRIPTIONS = {
     "analyze_portfolio":       "Analyse the user's portfolio holdings: allocation, diversification score, sector breakdown",
     "get_market_data":         "Real-time price, P/E ratio, market cap and analysis for specific stock tickers",
     "plan_financial_goal":     "Savings / retirement goal planning: can I reach $X in Y years, monthly contributions needed",
-    "get_financial_news":      "Recent news headlines for specific stocks or tickers",
+    "get_financial_news":      "Recent news headlines for specific stocks, tickers, or all portfolio holdings",
     "get_tax_education":       "Tax on investments: capital gains, IRA/Roth IRA, 401k, HSA, tax-loss harvesting",
 }
 
@@ -196,12 +196,21 @@ class _ToolSelection(BaseModel):
     tools: list[str]
 
 
+_PORTFOLIO_REF_PHRASES = (
+    "my holding", "my portfolio", "my stock", "my top",
+    "all the stock", "all stocks", "all my stock",
+    "those stocks", "these stocks", "the stocks",
+    "news of", "news on", "news about",
+    "summary of", "summarize",
+)
+
+
 def _enrich_query(state: FinnieState, query: str) -> str:
-    """Inject remembered portfolio tickers when the user says 'my portfolio' without listing them."""
+    """Inject remembered portfolio tickers when the user refers to their holdings without listing them."""
     holdings = state.get("portfolio_holdings") or {}
     if not holdings or _TICKER_RE.search(query):
         return query
-    if not any(p in query.lower() for p in ["my holding", "my portfolio", "my stock", "my top"]):
+    if not any(p in query.lower() for p in _PORTFOLIO_REF_PHRASES):
         return query
     ticker_list = ", ".join(f"{t}: {int(s)}" for t, s in holdings.items())
     return f"Portfolio: {ticker_list}\n\nQuestion: {query}"
@@ -232,6 +241,7 @@ def _select_tools(query: str, ctx_note: str) -> list[str]:
         f"Query: {query}{ctx_note}\n\n"
         "Rules (apply the FIRST matching rule and stop — do not stack rules):\n"
         "- News, headlines, or recent events for a specific stock or ticker → get_financial_news + get_market_data\n"
+        "- News for the user's portfolio stocks / all stocks / how news affects selling decision → get_financial_news + analyze_portfolio\n"
         "- General advice, tips, or education → answer_finance_question + plan_financial_goal (if goal in context, else + get_tax_education)\n"
         "- Any 'explain', 'what is', 'how does', 'what are' question (NOT news/prices) → answer_finance_question + get_tax_education\n"
         "- Context has goal_amount + timeline and message adds savings/contribution/risk → plan_financial_goal + get_tax_education\n"
