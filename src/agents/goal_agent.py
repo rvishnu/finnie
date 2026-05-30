@@ -85,6 +85,12 @@ class _GoalParams(BaseModel):
         "If given as monthly, multiply by 12. "
         "Return null if no ongoing contribution amount is mentioned."
     ))
+    annual_return_rate: float | None = Field(None, description=(
+        "User's stated annual investment return rate as a decimal (e.g. 0.15 for 15%). "
+        "Extract ONLY when the user explicitly states a specific percentage like '15% return', "
+        "'grows at 10%', '8% annual growth', '15% annual growth rate'. "
+        "Return null if not explicitly stated — do NOT infer from risk profile."
+    ))
     withdrawal_mode: bool = Field(False, description=(
         "True when the user asks how much they can WITHDRAW from existing savings, "
         "how long their nest egg will last, or asks about retirement income drawdown. "
@@ -238,6 +244,7 @@ class GoalPlanningAgent:
             "current_savings":     parsed.current_savings,
             "risk_profile":        parsed.risk_profile,
             "annual_contribution": parsed.annual_contribution,
+            "annual_return_rate":  parsed.annual_return_rate,
             "withdrawal_mode":     parsed.withdrawal_mode,
             "withdrawal_amount":   parsed.withdrawal_amount,
             "nest_egg":            parsed.nest_egg,
@@ -535,6 +542,7 @@ class GoalPlanningAgent:
                 "error":   str | None
             }
         """
+        stated_return_rate = None
         if query:
             parsed = self._parse_goal_from_text(query)
             goal_amount         = goal_amount        or parsed["goal_amount"]
@@ -546,6 +554,7 @@ class GoalPlanningAgent:
             # Caller-provided annual_contribution (from state) wins; fall back to query parse
             if annual_contribution is None:
                 annual_contribution = parsed.get("annual_contribution")
+            stated_return_rate = parsed.get("annual_return_rate")
         elif goal_amount is None or time_horizon_years is None:
             return {
                 "answer":  "Please describe your financial goal so I can help you plan for it.",
@@ -557,14 +566,32 @@ class GoalPlanningAgent:
         if current_savings is None:
             current_savings = 0.0
 
-        log.info("GoalPlanningAgent | goal=%s | contrib=%s/yr | horizon=%s yr | risk=%s",
+        annual_return = stated_return_rate if stated_return_rate else RETURN_RATES.get(risk_profile, RETURN_RATES["moderate"])
+        log.info("GoalPlanningAgent | goal=%s | contrib=%s/yr | horizon=%s yr | risk=%s | return=%.1f%%",
                  f"${goal_amount:,.0f}" if goal_amount else "projection",
                  f"${annual_contribution:,.0f}" if annual_contribution else "none",
                  time_horizon_years or "?",
-                 risk_profile)
-        annual_return = RETURN_RATES.get(risk_profile, RETURN_RATES["moderate"])
+                 risk_profile,
+                 annual_return * 100)
 
-        # Projection mode: user asks "how much will I have?" without a target goal
+        # Pure-growth projection: "I have $X, it grows at R% for N years — how much do I end up with?"
+        # No goal target, no required contributions — Python does the arithmetic, LLM only explains.
+        if not goal_amount and not annual_contribution and current_savings and time_horizon_years:
+            metrics = self._calculate_projection_metrics(0.0, time_horizon_years, current_savings, annual_return)
+            metrics_str = self._format_projection_metrics_for_llm(metrics)
+            context = self._get_rag_context(query or f"compound growth {current_savings} at {annual_return*100:.0f}% for {time_horizon_years} years")
+            answer = self.projection_chain.invoke({
+                "metrics":           metrics_str,
+                "context":           context,
+                "risk_profile":      risk_profile,
+                "annual_return_pct": metrics["annual_return_pct"],
+            })
+            answer = self._escape_markdown_currency(answer)
+            log.info("GoalPlanningAgent | pure-growth projection | pv=%.0f r=%.1f%% n=%.0f projected=%.0f",
+                     current_savings, annual_return * 100, time_horizon_years, metrics["projected_value"])
+            return {"answer": answer, "metrics": metrics, "error": None}
+
+        # Projection mode: user asks "how much will I have?" with ongoing contributions but no goal
         if not goal_amount and annual_contribution and time_horizon_years:
             metrics     = self._calculate_projection_metrics(annual_contribution, time_horizon_years, current_savings, annual_return)
             metrics_str = self._format_projection_metrics_for_llm(metrics)
